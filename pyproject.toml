@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video-profanity-censor"
+version = "0.1.0"
+description = "A CLI application for detecting and censoring profanity in video files"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+
+dependencies = [
+    "openai-whisper>=20231117",
+    "onnxruntime-directml>=1.16.0",
+    "faster-whisper>=1.0.0",
+    "ffmpeg-python>=0.2.0",
+    "pydub>=0.25.1",
+    "nltk>=3.8.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "hypothesis>=6.92.0",
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+]
+
+[project.scripts]
+video-profanity-censor = "video_profanity_censor.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["video_profanity_censor*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v"
+
+[tool.hypothesis]
+max_examples = 100
+deadline = 5000
