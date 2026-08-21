@@ -55,6 +55,17 @@ class BackendSelector:
             available_backends.append(directml_info)
             if directml_info.is_available:
                 gpu_vram_mb = directml_info.vram_mb
+                logger.info(
+                    "DirectML available: %s (VRAM: %s MB)",
+                    directml_info.device_name,
+                    directml_info.vram_mb,
+                )
+            else:
+                logger.info(
+                    "DirectML unavailable: %s", directml_info.reason_unavailable
+                )
+        else:
+            logger.info("DirectML detection skipped (non-Windows platform).")
 
         if preferred_backend == AccelerationBackend.CPU:
             selected = AccelerationBackend.CPU
@@ -176,8 +187,11 @@ class BackendSelector:
         """Checks whether onnxruntime has DmlExecutionProvider available."""
         try:
             import onnxruntime as ort
-            return "DmlExecutionProvider" in ort.get_available_providers()
+            providers = ort.get_available_providers()
+            logger.info("ONNX Runtime providers: %s", providers)
+            return "DmlExecutionProvider" in providers
         except ImportError:
+            logger.info("onnxruntime is not installed.")
             return False
 
     def _query_system_ram(self) -> int | None:
