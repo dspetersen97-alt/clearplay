@@ -9,7 +9,8 @@ import sys
 from pathlib import Path
 
 from video_profanity_censor.censor_engine import CensorEngine
-from video_profanity_censor.models import CensorMode
+from video_profanity_censor.logging_config import setup_logging
+from video_profanity_censor.models import AccelerationBackend, CensorMode
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -91,11 +92,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["auto", "directml", "cpu"],
+        default="auto",
+        help=(
+            "Hardware acceleration backend: 'auto' to detect AMD GPU via DirectML, "
+            "'directml' to force AMD GPU, 'cpu' to force CPU (default: auto)"
+        ),
+    )
+
+    parser.add_argument(
         "--model-size",
         type=str,
         choices=["tiny", "base", "small", "medium", "large"],
         default=None,
         help="Whisper model size (default: auto-select based on system RAM)",
+    )
+
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="Path for the log file (default: <input>_censor.log)",
     )
 
     return parser.parse_args(argv)
@@ -113,6 +132,18 @@ def _resolve_censor_mode(mode_str: str) -> CensorMode:
     if mode_str == "mute":
         return CensorMode.MUTE
     return CensorMode.TONE
+
+
+def _resolve_backend(backend_str: str) -> AccelerationBackend | None:
+    """Convert CLI backend string to AccelerationBackend enum.
+
+    Returns None for 'auto' to trigger auto-detection in the engine.
+    """
+    if backend_str == "directml":
+        return AccelerationBackend.DIRECTML
+    if backend_str == "cpu":
+        return AccelerationBackend.CPU
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -138,12 +169,21 @@ def main(argv: list[str] | None = None) -> int:
 
     # Resolve enums
     censor_mode = _resolve_censor_mode(args.mode)
+    backend = _resolve_backend(args.backend)
+
+    # Set up logging
+    if args.log_file:
+        log_path = Path(args.log_file)
+    else:
+        log_path = input_path.parent / f"{input_path.stem}_censor.log"
+    setup_logging(log_path)
 
     # Display startup info
     print(f"Video Profanity Censor")
     print(f"Input: {input_path}")
     if output_path:
         print(f"Output: {output_path}")
+    print(f"Backend: {args.backend}")
     if args.model_size:
         print(f"Model size: {args.model_size}")
     else:
@@ -162,6 +202,7 @@ def main(argv: list[str] | None = None) -> int:
         report_path=report_path,
         subtitle_path=subtitle_path,
         disable_subtitle_prefilter=args.disable_subtitle_prefilter,
+        backend=backend,
         model_size=args.model_size,
     )
 

@@ -477,3 +477,153 @@ class TestMockWhisperPredictableOutput:
 
         assert result.has_speech is False
         assert any("not found" in w.lower() for w in result.warnings)
+
+
+class TestDirectMLBackendRouting:
+    """Tests for DirectML backend selection and routing."""
+
+    def test_directml_backend_stored(self):
+        """DirectML backend should be stored when specified."""
+        recognizer = SpeechRecognizer(
+            model_size="medium", backend=AccelerationBackend.DIRECTML
+        )
+        assert recognizer.backend == AccelerationBackend.DIRECTML
+
+    def test_cpu_backend_stored(self):
+        """CPU backend should be stored when specified."""
+        recognizer = SpeechRecognizer(
+            model_size="medium", backend=AccelerationBackend.CPU
+        )
+        assert recognizer.backend == AccelerationBackend.CPU
+
+    def test_ensure_model_loaded_routes_to_directml(self):
+        """When backend is DIRECTML, model loading should route to DirectML path."""
+        recognizer = SpeechRecognizer(
+            model_size="medium", backend=AccelerationBackend.DIRECTML
+        )
+        with patch.object(recognizer, "_load_model_directml") as mock_load:
+            recognizer._ensure_model_loaded()
+            mock_load.assert_called_once_with("medium")
+
+    def test_ensure_model_loaded_routes_to_cpu(self):
+        """When backend is CPU, model loading should route to CPU path."""
+        recognizer = SpeechRecognizer(
+            model_size="medium", backend=AccelerationBackend.CPU
+        )
+        with patch.object(recognizer, "_load_model_cpu") as mock_load:
+            recognizer._ensure_model_loaded()
+            mock_load.assert_called_once_with("medium")
+
+    def test_ensure_model_loaded_skips_when_already_loaded(self):
+        """Should not reload model when already loaded."""
+        recognizer = SpeechRecognizer(
+            model_size="medium", backend=AccelerationBackend.DIRECTML
+        )
+        recognizer._model = {"type": "directml", "model_size": "medium"}
+        with patch.object(recognizer, "_load_model_directml") as mock_load:
+            recognizer._ensure_model_loaded()
+            mock_load.assert_not_called()
+
+    def test_run_transcription_dispatches_to_directml(self, tmp_path):
+        """When model type is directml, should use DirectML transcription."""
+        audio_file = tmp_path / "test.wav"
+        audio_file.write_bytes(b"\x00" * 100)
+
+        recognizer = SpeechRecognizer(
+            model_size="medium", backend=AccelerationBackend.DIRECTML
+        )
+        recognizer._model = {"type": "directml", "model_size": "medium"}
+
+        mock_result = TranscriptionResult(words=[], has_speech=False)
+        with patch.object(
+            recognizer, "_transcribe_with_directml", return_value=mock_result
+        ) as mock_transcribe:
+            recognizer._run_transcription(audio_file)
+            mock_transcribe.assert_called_once()
+
+    def test_run_transcription_dispatches_to_cpu(self, tmp_path):
+        """When model type is cpu, should use faster-whisper transcription."""
+        audio_file = tmp_path / "test.wav"
+        audio_file.write_bytes(b"\x00" * 100)
+
+        recognizer = SpeechRecognizer(
+            model_size="medium", backend=AccelerationBackend.CPU
+        )
+
+        mock_model = MagicMock()
+        mock_info = MagicMock()
+        mock_model.transcribe.return_value = (iter([]), mock_info)
+        recognizer._model = {
+            "type": "cpu",
+            "model_size": "medium",
+            "whisper_model": mock_model,
+        }
+
+        mock_result = TranscriptionResult(words=[], has_speech=False)
+        with patch.object(
+            recognizer, "_transcribe_with_faster_whisper", return_value=mock_result
+        ) as mock_transcribe:
+            recognizer._run_transcription(audio_file)
+            mock_transcribe.assert_called_once()
+
+
+class TestDirectMLModelLoading:
+    """Tests for DirectML model loading."""
+
+    def test_directml_raises_when_optimum_not_installed(self):
+        """Should raise RuntimeError when optimum is not installed."""
+        recognizer = SpeechRecognizer(
+            model_size="medium", backend=AccelerationBackend.DIRECTML
+        )
+        with patch(
+            "builtins.__import__",
+            side_effect=ImportError("No module named 'optimum'"),
+        ):
+            with pytest.raises(RuntimeError, match="optimum and transformers are required"):
+                recognizer._load_model_directml("medium")
+
+    def test_directml_invalid_model_size_raises(self):
+        """Should raise ValueError for unsupported model sizes."""
+        recognizer = SpeechRecognizer(
+            model_size="huge", backend=AccelerationBackend.DIRECTML
+        )
+
+        mock_optimum = MagicMock()
+        mock_transformers = MagicMock()
+
+        with patch.dict("sys.modules", {
+            "optimum": mock_optimum,
+            "optimum.onnxruntime": mock_optimum.onnxruntime,
+            "transformers": mock_transformers,
+        }):
+            with pytest.raises(ValueError, match="Unsupported model size"):
+                recognizer._load_model_directml("huge")
+
+
+class TestOOMFallback:
+    """Tests for GPU OOM fallback to CPU."""
+
+    def test_oom_falls_back_to_cpu(self, tmp_path):
+        """OOM during DirectML should fall back to CPU."""
+        audio_file = tmp_path / "test.wav"
+        audio_file.write_bytes(b"\x00" * 100)
+
+        recognizer = SpeechRecognizer(
+            model_size="medium", backend=AccelerationBackend.DIRECTML
+        )
+        recognizer._model = {"type": "directml", "model_size": "medium"}
+
+        cpu_result = TranscriptionResult(
+            words=[TranscribedWord(word="test", start=0.0, end=0.5, confidence=0.9)],
+            has_speech=True,
+        )
+
+        with patch.object(recognizer, "_load_model_cpu"):
+            with patch.object(
+                recognizer, "_run_transcription", return_value=cpu_result
+            ):
+                result = recognizer._handle_oom(audio_file)
+
+        assert recognizer._backend == AccelerationBackend.CPU
+        assert recognizer._fell_back_to_cpu is True
+        assert any("fell back" in w.lower() for w in result.warnings)

@@ -6,9 +6,12 @@ variant support via NLTK stemming. It avoids substring false positives
 (the Scunthorpe problem) by comparing only whole words.
 """
 
+import logging
 import re
 
 from nltk.stem import SnowballStemmer
+
+logger = logging.getLogger(__name__)
 
 from video_profanity_censor.models import (
     CensorMode,
@@ -25,6 +28,13 @@ _stemmer = SnowballStemmer("english")
 
 # Pattern to strip leading/trailing punctuation from words
 _PUNCTUATION_PATTERN = re.compile(r"^[^\w]+|[^\w]+$")
+
+
+def _format_timestamp(seconds: float) -> str:
+    """Format seconds as MM:SS.mmm."""
+    minutes = int(seconds // 60)
+    secs = seconds % 60
+    return f"{minutes:02d}:{secs:06.3f}"
 
 
 class ProfanityDetector:
@@ -84,6 +94,12 @@ class ProfanityDetector:
                     censor_action=self._censor_mode,
                 )
                 detections.append(detection)
+                logger.info(
+                    "[PROFANITY] Detected \"%s\" at %s - %s",
+                    transcribed_word.word,
+                    _format_timestamp(transcribed_word.start),
+                    _format_timestamp(transcribed_word.end),
+                )
 
         return DetectionResult(
             detections=detections,

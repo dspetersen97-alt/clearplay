@@ -3,11 +3,12 @@
 import pytest
 
 from video_profanity_censor.cli import (
+    _resolve_backend,
     _resolve_censor_mode,
     main,
     parse_args,
 )
-from video_profanity_censor.models import CensorMode
+from video_profanity_censor.models import AccelerationBackend, CensorMode
 
 
 class TestParseArgs:
@@ -24,6 +25,7 @@ class TestParseArgs:
         assert args.output is None
         assert args.audio_track == 0
         assert args.mode == "mute"
+        assert args.backend == "auto"
         assert args.profanity_list is None
         assert args.report_path is None
         assert args.subtitle_path is None
@@ -94,6 +96,17 @@ class TestParseArgs:
         with pytest.raises(SystemExit):
             parse_args([])
 
+    def test_backend_choices(self):
+        """Backend accepts valid choices."""
+        for backend in ["auto", "directml", "cpu"]:
+            args = parse_args(["movie.mp4", "--backend", backend])
+            assert args.backend == backend
+
+    def test_invalid_backend_rejected(self):
+        """Invalid backend values are rejected."""
+        with pytest.raises(SystemExit):
+            parse_args(["movie.mp4", "--backend", "cuda"])
+
     def test_all_arguments_together(self):
         """All arguments can be specified together."""
         args = parse_args([
@@ -101,6 +114,7 @@ class TestParseArgs:
             "--output", "out.mp4",
             "--audio-track", "1",
             "--mode", "mute",
+            "--backend", "directml",
             "--profanity-list", "words.txt",
             "--report-path", "report.txt",
             "--subtitle-path", "subs.srt",
@@ -111,6 +125,7 @@ class TestParseArgs:
         assert args.output == "out.mp4"
         assert args.audio_track == 1
         assert args.mode == "mute"
+        assert args.backend == "directml"
         assert args.profanity_list == "words.txt"
         assert args.report_path == "report.txt"
         assert args.subtitle_path == "subs.srt"
@@ -126,6 +141,19 @@ class TestResolveCensorMode:
 
     def test_mute_mode(self):
         assert _resolve_censor_mode("mute") == CensorMode.MUTE
+
+
+class TestResolveBackend:
+    """Tests for _resolve_backend helper."""
+
+    def test_auto_returns_none(self):
+        assert _resolve_backend("auto") is None
+
+    def test_directml_returns_directml(self):
+        assert _resolve_backend("directml") == AccelerationBackend.DIRECTML
+
+    def test_cpu_returns_cpu(self):
+        assert _resolve_backend("cpu") == AccelerationBackend.CPU
 
 
 class TestMainFunction:

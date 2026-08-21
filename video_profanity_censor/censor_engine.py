@@ -105,23 +105,28 @@ class CensorEngine:
 
         try:
             # --- Stage 1: Validation ---
+            logger.info("[VALIDATION] Starting input validation...")
             progress_callback(ProcessingStage.VALIDATION, 0.0, "Validating input file...")
             validation_result = self._stage_validate(input_path)
             if not validation_result.is_valid:
+                logger.error("[VALIDATION] %s", validation_result.error_message)
                 return ProcessingResult(
                     success=False,
                     error_message=validation_result.error_message,
                     error_stage=ProcessingStage.VALIDATION,
                     total_elapsed_seconds=time.time() - start_time,
                 )
+            logger.info("[VALIDATION] Validation complete")
             progress_callback(ProcessingStage.VALIDATION, 100.0, "Validation complete")
 
             # --- Stage 2: Audio Extraction ---
+            logger.info("[AUDIO_EXTRACTION] Extracting audio track %d...", audio_track)
             progress_callback(ProcessingStage.VALIDATION, 100.0, "Extracting audio track...")
             try:
                 extraction_result = self._stage_extract_audio(input_path, audio_track)
                 temp_files.append(extraction_result.output_path)
             except Exception as e:
+                logger.error("[AUDIO_EXTRACTION] Audio extraction failed: %s", e)
                 return ProcessingResult(
                     success=False,
                     error_message=f"Audio extraction failed: {e}",
@@ -130,10 +135,12 @@ class CensorEngine:
                 )
 
             # --- Stage 3: Backend Detection ---
+            logger.info("[BACKEND_DETECTION] Detecting hardware acceleration...")
             progress_callback(ProcessingStage.BACKEND_DETECTION, 0.0, "Detecting hardware acceleration...")
             try:
                 backend_result = self._stage_detect_backend(backend)
                 if backend_result.error_message:
+                    logger.error("[BACKEND_DETECTION] %s", backend_result.error_message)
                     return ProcessingResult(
                         success=False,
                         error_message=backend_result.error_message,
@@ -147,18 +154,22 @@ class CensorEngine:
                 else:
                     model_size_used = backend_result.selected_model_size
             except Exception as e:
+                logger.error("[BACKEND_DETECTION] Backend detection failed: %s", e)
                 return ProcessingResult(
                     success=False,
                     error_message=f"Backend detection failed: {e}",
                     error_stage=ProcessingStage.BACKEND_DETECTION,
                     total_elapsed_seconds=time.time() - start_time,
                 )
+            logger.info("[BACKEND_DETECTION] Using %s backend with %s model", active_backend.value, model_size_used)
             progress_callback(ProcessingStage.BACKEND_DETECTION, 100.0, f"Using {active_backend.value} backend with {model_size_used} model")
 
             # --- Stage 4: Load Profanity List ---
+            logger.info("[PROFANITY_LIST] Loading profanity list...")
             try:
                 profanity_list = load_profanity_list(profanity_list_path)
             except Exception as e:
+                logger.error("[PROFANITY_LIST] Failed to load profanity list: %s", e)
                 return ProcessingResult(
                     success=False,
                     error_message=f"Failed to load profanity list: {e}",
@@ -171,12 +182,14 @@ class CensorEngine:
             # --- Stage 5: Subtitle Scanning (optional) ---
             subtitle_scan_result: SubtitleScanResult | None = None
             if not disable_subtitle_prefilter:
+                logger.info("[SUBTITLE_SCANNING] Scanning subtitles for profanity...")
                 progress_callback(ProcessingStage.SUBTITLE_SCANNING, 0.0, "Scanning subtitles for profanity...")
                 try:
                     subtitle_scan_result = self._stage_scan_subtitles(
                         input_path, subtitle_path, profanity_list
                     )
                 except Exception as e:
+                    logger.error("[SUBTITLE_SCANNING] Subtitle scanning failed: %s", e)
                     return ProcessingResult(
                         success=False,
                         error_message=f"Subtitle scanning failed: {e}",
@@ -204,6 +217,7 @@ class CensorEngine:
                     )
 
             # --- Stage 6: Transcription ---
+            logger.info("[TRANSCRIPTION] Starting audio transcription...")
             progress_callback(ProcessingStage.TRANSCRIPTION, 0.0, "Transcribing audio...")
             try:
                 transcription_result = self._stage_transcribe(
@@ -214,6 +228,7 @@ class CensorEngine:
                     progress_callback,
                 )
             except Exception as e:
+                logger.error("[TRANSCRIPTION] Transcription failed: %s", e)
                 self._cleanup_temp_files(temp_files)
                 return ProcessingResult(
                     success=False,
@@ -226,12 +241,14 @@ class CensorEngine:
             progress_callback(ProcessingStage.TRANSCRIPTION, 100.0, "Transcription complete")
 
             # --- Stage 7: Profanity Detection ---
+            logger.info("[PROFANITY_DETECTION] Scanning transcription for profanity...")
             progress_callback(ProcessingStage.PROFANITY_DETECTION, 0.0, "Detecting profanity...")
             try:
                 detection_result = self._stage_detect_profanity(
                     transcription_result, profanity_list, censor_mode
                 )
             except Exception as e:
+                logger.error("[PROFANITY_DETECTION] Profanity detection failed: %s", e)
                 self._cleanup_temp_files(temp_files)
                 return ProcessingResult(
                     success=False,
@@ -259,6 +276,7 @@ class CensorEngine:
                 )
 
             # --- Stage 8: Audio Censoring ---
+            logger.info("[AUDIO_CENSORING] Censoring %d profane segments...", len(detection_result.detections))
             progress_callback(ProcessingStage.AUDIO_CENSORING, 0.0, "Censoring audio...")
             try:
                 censor_result = self._stage_censor_audio(
@@ -269,6 +287,7 @@ class CensorEngine:
                 )
                 temp_files.append(censor_result.censored_audio_path)
             except Exception as e:
+                logger.error("[AUDIO_CENSORING] Audio censoring failed: %s", e)
                 self._cleanup_temp_files(temp_files)
                 return ProcessingResult(
                     success=False,
@@ -281,6 +300,7 @@ class CensorEngine:
             progress_callback(ProcessingStage.AUDIO_CENSORING, 100.0, "Audio censoring complete")
 
             # --- Stage 9: Output Assembly ---
+            logger.info("[OUTPUT_WRITING] Assembling output video...")
             progress_callback(ProcessingStage.OUTPUT_WRITING, 0.0, "Assembling output...")
             try:
                 assembly_result = self._stage_assemble_output(
@@ -290,6 +310,7 @@ class CensorEngine:
                     audio_track,
                 )
                 if assembly_result.error_message:
+                    logger.error("[OUTPUT_WRITING] %s", assembly_result.error_message)
                     self._cleanup_temp_files(temp_files)
                     return ProcessingResult(
                         success=False,
@@ -307,6 +328,7 @@ class CensorEngine:
                         f"Falling back to {assembly_result.codec_fallback.upper()} codec.",
                     )
             except Exception as e:
+                logger.error("[OUTPUT_WRITING] Output assembly failed: %s", e)
                 self._cleanup_temp_files(temp_files)
                 return ProcessingResult(
                     success=False,
@@ -319,12 +341,14 @@ class CensorEngine:
             progress_callback(ProcessingStage.OUTPUT_WRITING, 100.0, "Output assembly complete")
 
             # --- Stage 10: Report Generation ---
+            logger.info("[REPORT] Generating detection report...")
             self._generate_report(detection_result, report_path)
 
             # Cleanup and return success
             self._cleanup_temp_files(temp_files)
 
             elapsed = time.time() - start_time
+            logger.info("[COMPLETE] Processing finished in %.1fs — %d profane instances censored", elapsed, censor_result.segments_censored)
             return ProcessingResult(
                 success=True,
                 output_path=output_path,
@@ -337,7 +361,7 @@ class CensorEngine:
             )
 
         except Exception as e:
-            # Catch-all for unexpected errors
+            logger.error("[UNEXPECTED] Unexpected error: %s", e, exc_info=True)
             self._cleanup_temp_files(temp_files)
             return ProcessingResult(
                 success=False,

@@ -1,4 +1,4 @@
-"""Speech recognition component using Whisper via faster-whisper (CTranslate2)."""
+"""Speech recognition using Whisper via faster-whisper (CPU) or ONNX Runtime DirectML (AMD GPU)."""
 
 import logging
 import os
@@ -17,12 +17,21 @@ from video_profanity_censor.models import (
 
 logger = logging.getLogger(__name__)
 
+WHISPER_ONNX_MODEL_MAP = {
+    "tiny": "openai/whisper-tiny",
+    "base": "openai/whisper-base",
+    "small": "openai/whisper-small",
+    "medium": "openai/whisper-medium",
+    "large": "openai/whisper-large-v3",
+}
+
 
 class SpeechRecognizer:
     """Transcribes audio to text with word-level timestamps using Whisper.
 
-    Uses faster-whisper (CTranslate2) for optimized CPU inference with INT8
-    quantization, providing ~4x speedup over vanilla Whisper.
+    Supports two backends:
+    - CPU: faster-whisper (CTranslate2) with INT8 quantization
+    - DirectML: ONNX Runtime with DmlExecutionProvider for AMD GPUs on Windows
     """
 
     def __init__(
@@ -30,25 +39,17 @@ class SpeechRecognizer:
         model_size: str = "medium",
         backend: AccelerationBackend = AccelerationBackend.CPU,
     ):
-        """Initialize with Whisper model size.
-
-        Args:
-            model_size: Whisper model size (tiny/base/small/medium/large).
-            backend: Accepted for API compatibility. Only CPU is used.
-        """
         self._model_size = model_size
-        self._backend = AccelerationBackend.CPU  # Always CPU
+        self._backend = backend
         self._model = None
         self._fell_back_to_cpu = False
 
     @property
     def model_size(self) -> str:
-        """The Whisper model size being used."""
         return self._model_size
 
     @property
     def backend(self) -> AccelerationBackend:
-        """The acceleration backend being used."""
         return self._backend
 
     def transcribe(
@@ -76,7 +77,6 @@ class SpeechRecognizer:
                 warnings=[f"Audio file not found: {audio_path}"],
             )
 
-        # Load the model
         self._ensure_model_loaded()
 
         if regions:
@@ -85,17 +85,15 @@ class SpeechRecognizer:
             return self._transcribe_full(audio_path, progress_callback)
 
     def _ensure_model_loaded(self) -> None:
-        """Loads the model if not already loaded."""
         if self._model is not None:
             return
-        self._load_model_cpu(self._model_size)
+        if self._backend == AccelerationBackend.DIRECTML:
+            self._load_model_directml(self._model_size)
+        else:
+            self._load_model_cpu(self._model_size)
 
     def _load_model_cpu(self, model_size: str) -> None:
-        """Loads Whisper model via CTranslate2/faster-whisper for optimized CPU inference.
-
-        Uses faster-whisper which leverages CTranslate2 for INT8 quantization
-        and optimized CPU kernels (~4x faster than vanilla Whisper).
-        """
+        """Loads Whisper model via CTranslate2/faster-whisper for optimized CPU inference."""
         try:
             from faster_whisper import WhisperModel
         except ImportError as e:
@@ -119,20 +117,56 @@ class SpeechRecognizer:
         }
         logger.info(f"Whisper '{model_size}' model loaded on CPU backend.")
 
+    def _load_model_directml(self, model_size: str) -> None:
+        """Loads Whisper ONNX model with DirectML acceleration for AMD GPUs."""
+        try:
+            from optimum.onnxruntime import ORTModelForSpeechSeq2Seq
+            from transformers import AutoProcessor
+        except ImportError as e:
+            raise RuntimeError(
+                "optimum and transformers are required for DirectML backend. "
+                "Install with: pip install optimum[onnxruntime] transformers"
+            ) from e
+
+        model_id = WHISPER_ONNX_MODEL_MAP.get(model_size)
+        if model_id is None:
+            raise ValueError(
+                f"Unsupported model size '{model_size}' for DirectML. "
+                f"Supported: {', '.join(WHISPER_ONNX_MODEL_MAP.keys())}"
+            )
+
+        logger.info(
+            f"Loading Whisper '{model_size}' ONNX model with DirectML backend "
+            f"(model: {model_id})..."
+        )
+
+        try:
+            processor = AutoProcessor.from_pretrained(model_id)
+            model = ORTModelForSpeechSeq2Seq.from_pretrained(
+                model_id,
+                export=True,
+                provider="DmlExecutionProvider",
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load DirectML model '{model_id}': {e}. "
+                "Ensure onnxruntime-directml is installed and a DirectX 12 GPU is available."
+            ) from e
+
+        self._model = {
+            "type": "directml",
+            "model_size": model_size,
+            "model": model,
+            "processor": processor,
+            "model_id": model_id,
+        }
+        logger.info(f"Whisper '{model_size}' model loaded on DirectML backend.")
+
     def _transcribe_full(
         self,
         audio_path: Path,
         progress_callback: ProgressCallback = None,
     ) -> TranscriptionResult:
-        """Transcribes the entire audio file (full mode).
-
-        Args:
-            audio_path: Path to the WAV audio file.
-            progress_callback: Optional progress callback.
-
-        Returns:
-            TranscriptionResult with word-level timestamps.
-        """
         if progress_callback:
             progress_callback(ProcessingStage.TRANSCRIPTION, 0.0, "Starting full transcription...")
 
@@ -157,19 +191,6 @@ class SpeechRecognizer:
         regions: list[ProfanityRegion],
         progress_callback: ProgressCallback = None,
     ) -> TranscriptionResult:
-        """Transcribes only specified audio regions (targeted mode).
-
-        Extracts each region from the audio file and transcribes them individually,
-        then combines the results with correct time offsets.
-
-        Args:
-            audio_path: Path to the WAV audio file.
-            regions: List of ProfanityRegions to transcribe.
-            progress_callback: Optional progress callback.
-
-        Returns:
-            TranscriptionResult with combined word-level timestamps.
-        """
         if progress_callback:
             progress_callback(
                 ProcessingStage.TRANSCRIPTION,
@@ -205,7 +226,6 @@ class SpeechRecognizer:
                 all_skipped.extend(region_result.skipped_ranges)
 
             except Exception as e:
-                # Skip corrupted segments and continue with warning (Req 2.8)
                 warning_msg = (
                     f"Failed to transcribe region {region.start:.3f}s - "
                     f"{region.end:.3f}s: {e}"
@@ -219,7 +239,6 @@ class SpeechRecognizer:
         if progress_callback:
             progress_callback(ProcessingStage.TRANSCRIPTION, 100.0, "Transcription complete.")
 
-        # Add fallback warning if we fell back to CPU during processing
         if self._fell_back_to_cpu:
             all_warnings.append(
                 "GPU out-of-memory encountered. Fell back to CPU backend for processing."
@@ -237,21 +256,8 @@ class SpeechRecognizer:
         audio_path: Path,
         region: ProfanityRegion,
     ) -> TranscriptionResult:
-        """Transcribes a single audio region by extracting it and running Whisper.
-
-        The region audio is extracted to a temporary file, transcribed,
-        and the resulting timestamps are offset back to the original audio timeline.
-
-        Args:
-            audio_path: Path to the full audio file.
-            region: The ProfanityRegion to transcribe.
-
-        Returns:
-            TranscriptionResult with timestamps adjusted to original timeline.
-        """
         import subprocess
 
-        # Extract the region to a temporary file using ffmpeg
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
             tmp_path = Path(tmp_file.name)
 
@@ -280,7 +286,6 @@ class SpeechRecognizer:
                     f"FFmpeg failed to extract region: {result.stderr.strip()}"
                 )
 
-            # Transcribe the extracted segment
             try:
                 segment_result = self._run_transcription(tmp_path, progress_callback=None)
             except MemoryError:
@@ -291,31 +296,23 @@ class SpeechRecognizer:
                 else:
                     raise
 
-            # Offset timestamps back to original timeline
             offset_words = []
-            
-            # Get the earliest source cue start time — words detected before this
-            # are likely Whisper timestamp errors (anchoring to segment start)
+
             earliest_cue_start = min(
                 (cue.start for cue in region.source_cues),
                 default=region.start,
             )
-            
+
             for word in segment_result.words:
                 word_start = word.start + region.start
                 word_end = word.end + region.start
-                
-                # If word starts before the actual subtitle cue, Whisper's timestamp
-                # is anchored to segment start rather than actual speech timing.
-                # Clamp the word to start at the subtitle cue start instead.
+
                 if word_start < earliest_cue_start:
                     word_start = earliest_cue_start
-                    # If end is also before or at cue start, shift end to maintain
-                    # a reasonable word duration (use Whisper's duration estimate)
                     word_duration = word.end - word.start
                     if word_end <= earliest_cue_start:
                         word_end = earliest_cue_start + word_duration
-                
+
                 offset_words.append(
                     TranscribedWord(
                         word=word.word,
@@ -325,7 +322,6 @@ class SpeechRecognizer:
                     )
                 )
 
-            # Offset skipped ranges
             offset_skipped = []
             for skipped in segment_result.skipped_ranges:
                 offset_skipped.append(
@@ -342,7 +338,6 @@ class SpeechRecognizer:
                 skipped_ranges=offset_skipped,
             )
         finally:
-            # Clean up temporary file
             try:
                 os.unlink(tmp_path)
             except OSError:
@@ -353,18 +348,11 @@ class SpeechRecognizer:
         audio_path: Path,
         progress_callback: ProgressCallback = None,
     ) -> TranscriptionResult:
-        """Runs the actual Whisper transcription on an audio file.
-
-        Args:
-            audio_path: Path to the audio file to transcribe.
-            progress_callback: Optional progress callback.
-
-        Returns:
-            TranscriptionResult with word-level timestamps.
-        """
         if self._model is None:
             raise RuntimeError("Model not loaded. Call _ensure_model_loaded() first.")
 
+        if self._model["type"] == "directml":
+            return self._transcribe_with_directml(audio_path, progress_callback)
         return self._transcribe_with_faster_whisper(audio_path, progress_callback)
 
     def _transcribe_with_faster_whisper(
@@ -372,15 +360,6 @@ class SpeechRecognizer:
         audio_path: Path,
         progress_callback: ProgressCallback = None,
     ) -> TranscriptionResult:
-        """Transcribes audio using faster-whisper (CTranslate2 CPU backend).
-
-        Args:
-            audio_path: Path to the audio file.
-            progress_callback: Optional progress callback.
-
-        Returns:
-            TranscriptionResult with word-level timestamps.
-        """
         whisper_model = self._model["whisper_model"]
 
         try:
@@ -408,7 +387,6 @@ class SpeechRecognizer:
                 has_speech = True
 
                 for word_info in segment.words:
-                    # Skip words with very low confidence or empty text
                     word_text = word_info.word.strip()
                     if not word_text:
                         continue
@@ -422,7 +400,6 @@ class SpeechRecognizer:
                         )
                     )
         except Exception as e:
-            # Handle corrupted segment errors (Req 2.8)
             error_msg = str(e).lower()
             if "out of memory" in error_msg or "oom" in error_msg:
                 raise MemoryError(f"Out of memory during transcription: {e}") from e
@@ -430,7 +407,6 @@ class SpeechRecognizer:
             logger.warning(warning_msg)
             warnings.append(warning_msg)
 
-        # Handle no speech detected (Req 2.6)
         if not has_speech:
             return TranscriptionResult(
                 words=[],
@@ -445,22 +421,84 @@ class SpeechRecognizer:
             skipped_ranges=skipped_ranges,
         )
 
+    def _transcribe_with_directml(
+        self,
+        audio_path: Path,
+        progress_callback: ProgressCallback = None,
+    ) -> TranscriptionResult:
+        """Transcribes audio using ONNX Runtime with DirectML (AMD GPU)."""
+        import torch
+        from transformers import AutomaticSpeechRecognitionPipeline, pipeline
+
+        model = self._model["model"]
+        processor = self._model["processor"]
+        model_id = self._model["model_id"]
+
+        try:
+            pipe = pipeline(
+                "automatic-speech-recognition",
+                model=model,
+                tokenizer=processor.tokenizer,
+                feature_extractor=processor.feature_extractor,
+            )
+
+            result = pipe(
+                str(audio_path),
+                return_timestamps="word",
+                generate_kwargs={"language": "en"},
+            )
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "out of memory" in error_msg or "oom" in error_msg:
+                raise MemoryError(f"GPU out of memory during transcription: {e}") from e
+            raise
+
+        words: list[TranscribedWord] = []
+        has_speech = False
+
+        chunks = result.get("chunks", [])
+        for chunk in chunks:
+            text = chunk.get("text", "").strip()
+            if not text:
+                continue
+
+            timestamp = chunk.get("timestamp", (None, None))
+            if timestamp is None or len(timestamp) < 2:
+                continue
+
+            start, end = timestamp
+            if start is None:
+                continue
+            if end is None:
+                end = start + 0.5
+
+            has_speech = True
+            words.append(
+                TranscribedWord(
+                    word=text,
+                    start=float(start),
+                    end=float(end),
+                    confidence=1.0,
+                )
+            )
+
+        if not has_speech:
+            return TranscriptionResult(
+                words=[],
+                has_speech=False,
+                warnings=["No speech detected in audio."],
+            )
+
+        return TranscriptionResult(
+            words=words,
+            has_speech=True,
+        )
+
     def _handle_oom(
         self,
         audio_path: Path,
         progress_callback: ProgressCallback = None,
     ) -> TranscriptionResult:
-        """Handles GPU out-of-memory by falling back to CPU backend.
-
-        Logs a warning, switches to CPU, reloads the model, and retries transcription.
-
-        Args:
-            audio_path: Path to the audio file to retry.
-            progress_callback: Optional progress callback.
-
-        Returns:
-            TranscriptionResult from CPU backend transcription.
-        """
         logger.warning(
             "GPU out-of-memory encountered during inference. "
             "Falling back to CPU backend (CTranslate2/faster-whisper)."
@@ -469,22 +507,18 @@ class SpeechRecognizer:
         if progress_callback:
             progress_callback(
                 ProcessingStage.TRANSCRIPTION,
-                -1.0,  # Indeterminate progress during fallback
+                -1.0,
                 "GPU out-of-memory. Falling back to CPU backend...",
             )
 
-        # Switch to CPU backend
         self._backend = AccelerationBackend.CPU
         self._model = None
         self._fell_back_to_cpu = True
 
-        # Reload model on CPU
         self._load_model_cpu(self._model_size)
 
-        # Retry transcription on CPU
         result = self._run_transcription(audio_path, progress_callback)
 
-        # Add OOM fallback warning
         result.warnings.append(
             "GPU out-of-memory encountered. Fell back to CPU backend for processing."
         )
