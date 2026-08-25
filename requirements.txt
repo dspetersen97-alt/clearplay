@@ -1,6 +1,4 @@
 # Core dependencies
-openai-whisper>=20231117
-onnxruntime-directml>=1.16.0
 faster-whisper>=1.0.0
 ffmpeg-python>=0.2.0
 pydub>=0.25.1
