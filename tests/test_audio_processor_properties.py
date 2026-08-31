@@ -749,3 +749,174 @@ class TestChannelLayoutPreservation:
                 f"Multiple detections ({len(detections)}): output has "
                 f"{output_audio.channels} channels, expected {channels}"
             )
+
+
+# ============================================================================
+# Property 1: Bug Condition - Bounded-memory single-pass censoring
+# ============================================================================
+#
+# BUGFIX WORKFLOW - EXPLORATION TEST (audio-censor-oom-crash)
+#
+# GOAL: Surface a counterexample demonstrating that AudioProcessor.censor()'s
+# per-detection full-buffer rebuild
+#   (audio = audio[:start_ms] + replacement + audio[end_ms:])
+# drives peak memory growth with the number of detections.
+#
+# Bug condition (from design):
+#   (audio is long AND multichannel) AND (count(detections) is large)
+#   AND (censor rebuilds the full buffer once per detection)
+#
+# This test encodes the EXPECTED (post-fix) behavior: peak memory for 4N
+# detections should stay within a small constant multiple of the N-detection
+# peak (i.e. it should NOT scale with the detection count).
+#
+# On the UNFIXED code this test is EXPECTED TO FAIL: peak memory rises roughly
+# with the detection count because each detection re-slices and reallocates the
+# whole multichannel track. That failure confirms the bug exists.
+#
+# **Validates: Requirements 1.1, 1.2, 2.1, 2.2**
+
+import tracemalloc
+
+import pytest
+
+
+def _make_non_overlapping_detections(
+    count: int,
+    audio_duration_ms: int,
+    mode: CensorMode,
+    word_ms: int = 120,
+    gap_ms: int = 80,
+) -> list[Detection]:
+    """Build `count` evenly spaced, non-overlapping detections inside the track.
+
+    Each detection covers `word_ms` and is separated from the next by `gap_ms`,
+    so windows never overlap (keeping the comparison between N and 4N a pure
+    detection-count comparison rather than an overlap-precedence one).
+    """
+    step_ms = word_ms + gap_ms
+    detections: list[Detection] = []
+    # Leave a little headroom at the start and end of the track.
+    start_offset_ms = 200
+    for i in range(count):
+        start_ms = start_offset_ms + i * step_ms
+        end_ms = start_ms + word_ms
+        if end_ms >= audio_duration_ms - 200:
+            break
+        detections.append(
+            Detection(
+                word=f"word{i}",
+                timestamp_range=TimestampRange(
+                    start=start_ms / 1000.0,
+                    end=end_ms / 1000.0,
+                ),
+                censor_action=mode,
+            )
+        )
+    return detections
+
+
+def _peak_bytes_for_censor(
+    source_path: Path,
+    detections: list[Detection],
+    output_path: Path,
+    mode: CensorMode,
+) -> int:
+    """Run censor() once and return the tracemalloc peak (bytes) for the call."""
+    processor = AudioProcessor(mode=mode)
+    tracemalloc.start()
+    tracemalloc.reset_peak()
+    try:
+        processor.censor(
+            audio_path=source_path,
+            detections=detections,
+            output_path=output_path,
+        )
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    return peak
+
+
+class TestBoundedMemorySinglePassCensoring:
+    """Property 1: Bug Condition - Bounded-memory single-pass censoring.
+
+    Censoring a long, multichannel track with many detections SHALL apply all
+    replacements without reallocating the entire track per detection, so that
+    peak memory holds approximately one copy of the audio (a bound that does
+    NOT grow with the number of detections).
+
+    On UNFIXED code this test is EXPECTED TO FAIL (peak grows with detection
+    count), confirming the OOM-driving bug.
+
+    **Validates: Requirements 1.1, 1.2, 2.1, 2.2**
+    """
+
+    # Scaled-down buffer: 6 channels, several seconds, 48kHz. Large enough that a
+    # full-track rebuild is a meaningful allocation, small enough for CI.
+    CHANNELS = 6
+    SAMPLE_RATE = 48000
+    DURATION_MS = 8000
+    N = 8  # base detection count; 4N = 32
+
+    @pytest.mark.parametrize("mode", [CensorMode.MUTE, CensorMode.TONE])
+    def test_peak_memory_does_not_scale_with_detection_count(self, mode: CensorMode):
+        """Peak memory for 4N detections must stay within a small constant
+        multiple of the N-detection peak (bounded, independent of count).
+
+        UNFIXED expectation: FAILS because the per-detection full-buffer rebuild
+        makes peak memory scale with the number of detections.
+        """
+        source_audio = _create_test_audio(
+            channels=self.CHANNELS,
+            sample_rate=self.SAMPLE_RATE,
+            duration_ms=self.DURATION_MS,
+        )
+
+        n = self.N
+        four_n = 4 * self.N
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "source.wav"
+            source_audio.export(str(source_path), format="wav")
+
+            detections_n = _make_non_overlapping_detections(
+                n, self.DURATION_MS, mode
+            )
+            detections_4n = _make_non_overlapping_detections(
+                four_n, self.DURATION_MS, mode
+            )
+
+            # Sanity: we actually generated the intended number of detections.
+            assert len(detections_n) == n, (
+                f"expected {n} detections, generated {len(detections_n)}"
+            )
+            assert len(detections_4n) == four_n, (
+                f"expected {four_n} detections, generated {len(detections_4n)}"
+            )
+
+            out_n = Path(tmp_dir) / "out_n.wav"
+            out_4n = Path(tmp_dir) / "out_4n.wav"
+
+            peak_n = _peak_bytes_for_censor(source_path, detections_n, out_n, mode)
+            peak_4n = _peak_bytes_for_censor(source_path, detections_4n, out_4n, mode)
+
+            # Output must be produced (Property 1 / Requirement 2.2).
+            assert out_n.exists() and out_n.stat().st_size > 0
+            assert out_4n.exists() and out_4n.stat().st_size > 0
+
+            ratio = peak_4n / peak_n if peak_n else float("inf")
+
+            # Bounded-memory property: quadrupling the detection count must not
+            # meaningfully increase peak memory. Allow a small constant multiple
+            # (2.0x) as headroom for transient allocations. A single-pass stitch
+            # holds ~one copy of the audio regardless of count, so this holds
+            # after the fix; the per-detection rebuild violates it.
+            assert ratio <= 2.0, (
+                "Peak memory scaled with detection count "
+                f"(mode={mode.value}): peak_N={peak_n} bytes for N={n}, "
+                f"peak_4N={peak_4n} bytes for 4N={four_n}, ratio={ratio:.2f}x "
+                "(expected <= 2.0x for bounded single-pass censoring). "
+                "This indicates censor() rebuilds the full buffer once per "
+                "detection, driving the OOM."
+            )

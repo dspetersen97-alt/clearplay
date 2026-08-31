@@ -116,6 +116,13 @@ class AudioProcessor:
         crossfade_ms = 10  # 10ms crossfade at boundaries
         audio_duration_ms = len(audio)
 
+        # --- Phase A: compute resolved censor windows ---
+        # Iterate sorted detections and produce (start_ms, end_ms) windows using the
+        # identical window math as before (buffer, cap trimmed from the start, boundary
+        # clamping, and skipping non-positive-duration windows). This phase only computes
+        # windows and preserves the original per-detection accounting/progress semantics;
+        # it never touches the audio buffer.
+        resolved_windows: list[tuple[int, int]] = []
         for detection in sorted_detections:
             start_ms = int(detection.timestamp_range.start * 1000) - self.censor_buffer_ms
             end_ms = int(detection.timestamp_range.end * 1000) + self.censor_buffer_ms
@@ -138,6 +145,42 @@ class AudioProcessor:
             if duration_ms <= 0:
                 continue
 
+            resolved_windows.append((start_ms, end_ms))
+
+            total_censored_duration += duration_ms / 1000.0
+
+            if progress_callback:
+                progress = (sorted_detections.index(detection) + 1) / len(sorted_detections)
+                progress_callback(
+                    ProcessingStage.AUDIO_CENSORING,
+                    progress * 100,
+                    f"Censored segment {sorted_detections.index(detection) + 1}/{len(sorted_detections)}",
+                )
+
+        # --- Phase B: single-pass stitch ---
+        # Assemble the censored track in one sequential pass instead of rebuilding the
+        # entire buffer once per detection. Each source region and each replacement
+        # region is copied into `output` exactly once, so peak memory holds roughly one
+        # copy of the source plus the growing output — bounded and independent of the
+        # detection count (the fix for the OOM).
+        #
+        # To stay byte-for-byte equivalent with the original mutating implementation
+        # (`audio = audio[:start_ms] + replacement + audio[end_ms:]` per detection), the
+        # stitch reproduces its "last-writer-wins" precedence: because the original
+        # re-sliced the mutating buffer left-to-right, a later window fully overwrote any
+        # earlier window it overlapped. We resolve that precedence up front with a
+        # per-millisecond owner map (the highest-index window covering each position, or
+        # -1 for untouched source) and then emit contiguous runs in one forward pass.
+        # For the common non-overlapping / adjacent case this is a plain
+        # [gap][replacement][gap]... concatenation.
+        #
+        # Each window's replacement (tone/silence + crossfade) is generated once, using
+        # the identical logic as before; the owner map only selects which slice of each
+        # already-built replacement survives.
+        replacements: list[AudioSegment] = []
+        for start_ms, end_ms in resolved_windows:
+            duration_ms = end_ms - start_ms
+
             # Generate replacement audio
             if self.mode == CensorMode.TONE:
                 replacement = self._generate_tone(
@@ -154,27 +197,47 @@ class AudioProcessor:
                 if audio.channels > 1 and replacement.channels == 1:
                     replacement = replacement.set_channels(audio.channels)
 
-            # Apply crossfade at boundaries
+            # Apply crossfade at boundaries against the ORIGINAL audio (crossfade reads
+            # only the replacement, so behavior is unchanged).
             replacement = self._apply_crossfade(
                 audio, replacement, start_ms, end_ms, crossfade_ms
             )
 
-            # Replace the segment in the audio
-            audio = audio[:start_ms] + replacement + audio[end_ms:]
+            replacements.append(replacement)
 
-            total_censored_duration += duration_ms / 1000.0
+        # Resolve per-position ownership (last-writer-wins), matching the original
+        # left-to-right overwrite behavior for overlapping/adjacent windows.
+        owner = [-1] * audio_duration_ms
+        for idx, (start_ms, end_ms) in enumerate(resolved_windows):
+            for position in range(start_ms, end_ms):
+                owner[position] = idx
 
-            if progress_callback:
-                progress = (sorted_detections.index(detection) + 1) / len(sorted_detections)
-                progress_callback(
-                    ProcessingStage.AUDIO_CENSORING,
-                    progress * 100,
-                    f"Censored segment {sorted_detections.index(detection) + 1}/{len(sorted_detections)}",
-                )
+        # Emit contiguous runs in a single forward pass, referencing each source or
+        # replacement region exactly once.
+        output = audio[:0]  # empty segment with matching frame rate and channels
+        position = 0
+        while position < audio_duration_ms:
+            current_owner = owner[position]
+            run_end = position + 1
+            while run_end < audio_duration_ms and owner[run_end] == current_owner:
+                run_end += 1
+
+            if current_owner == -1:
+                # Unchanged source gap
+                output += audio[position:run_end]
+            else:
+                # Surviving slice of the winning window's replacement, offset into that
+                # replacement so partially-overwritten replacements slice correctly.
+                win_start_ms = resolved_windows[current_owner][0]
+                output += replacements[current_owner][
+                    position - win_start_ms : run_end - win_start_ms
+                ]
+
+            position = run_end
 
         # Export the censored audio
         export_params = self._build_export_params(audio_metadata)
-        audio.export(str(output_path), **export_params)
+        output.export(str(output_path), **export_params)
 
         return CensorResult(
             censored_audio_path=output_path,
