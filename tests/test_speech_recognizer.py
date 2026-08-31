@@ -3,6 +3,7 @@
 Requirements: 2.1, 2.2, 2.6, 2.8, 9.8, 9.9, 9.10
 """
 
+import weakref
 from pathlib import Path
 from unittest.mock import MagicMock, patch, PropertyMock
 
@@ -361,6 +362,88 @@ class TestModelLoadingCPU:
             device="cpu",
             compute_type="int8",
         )
+
+
+class TestModelRelease:
+    """Test releasing the Whisper model to free its RAM (Req 9.8).
+
+    The CTranslate2 model holds several GB of RAM for a medium model and is
+    only needed while transcribing, so it has to be droppable before the
+    memory-heavy stages that follow transcription.
+    """
+
+    def test_release_drops_the_model(self):
+        """Releasing clears the loaded model."""
+        recognizer = SpeechRecognizer(model_size="medium")
+        recognizer._model = {
+            "type": "cpu",
+            "model_size": "medium",
+            "whisper_model": MagicMock(),
+        }
+
+        recognizer.release_model()
+
+        assert recognizer._model is None
+
+    def test_release_collects_garbage(self):
+        """Releasing forces a collection so native buffers are freed now."""
+        recognizer = SpeechRecognizer(model_size="medium")
+        recognizer._model = {
+            "type": "cpu",
+            "model_size": "medium",
+            "whisper_model": MagicMock(),
+        }
+
+        with patch("video_profanity_censor.speech_recognizer.gc.collect") as collect:
+            recognizer.release_model()
+
+        collect.assert_called_once()
+
+    def test_release_leaves_no_reference_to_the_whisper_model(self):
+        """The model object itself becomes collectable after release."""
+
+        class FakeWhisperModel:
+            """Plain class so it can be tracked by a weak reference."""
+
+        recognizer = SpeechRecognizer(model_size="medium")
+        whisper_model = FakeWhisperModel()
+        recognizer._model = {
+            "type": "cpu",
+            "model_size": "medium",
+            "whisper_model": whisper_model,
+        }
+        tracker = weakref.ref(whisper_model)
+        del whisper_model
+
+        recognizer.release_model()
+
+        assert tracker() is None
+
+    def test_release_is_idempotent(self):
+        """Releasing an unloaded or already released model is a no-op."""
+        recognizer = SpeechRecognizer(model_size="medium")
+
+        with patch("video_profanity_censor.speech_recognizer.gc.collect") as collect:
+            recognizer.release_model()
+            recognizer.release_model()
+
+        assert recognizer._model is None
+        collect.assert_not_called()
+
+    def test_model_is_reloaded_if_used_again_after_release(self):
+        """Transcribing after a release loads the model again."""
+        recognizer = SpeechRecognizer(model_size="medium")
+        recognizer._model = {
+            "type": "cpu",
+            "model_size": "medium",
+            "whisper_model": MagicMock(),
+        }
+        recognizer.release_model()
+
+        with patch.object(recognizer, "_load_model_cpu") as load:
+            recognizer._ensure_model_loaded()
+
+        load.assert_called_once_with("medium")
 
 
 class TestMockWhisperPredictableOutput:

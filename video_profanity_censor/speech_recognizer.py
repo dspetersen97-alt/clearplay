@@ -1,5 +1,6 @@
 """Speech recognition component using Whisper via faster-whisper (CTranslate2)."""
 
+import gc
 import logging
 import os
 import tempfile
@@ -83,6 +84,24 @@ class SpeechRecognizer:
             return self._transcribe_regions(audio_path, regions, progress_callback)
         else:
             return self._transcribe_full(audio_path, progress_callback)
+
+    def release_model(self) -> None:
+        """Releases the Whisper model, freeing the RAM it holds.
+
+        The CTranslate2 model holds several GB of RAM but is only needed while
+        transcribing — everything downstream works on the TranscriptionResult —
+        so it should be released as soon as transcription finishes. Calling this
+        repeatedly is safe, and transcribe() reloads the model if it is used
+        again afterwards.
+        """
+        if self._model is None:
+            return
+
+        logger.info(f"Releasing Whisper '{self._model_size}' model.")
+        self._model = None
+        # CTranslate2 frees its native buffers when the model object is
+        # collected, so make that happen now rather than at some later GC
+        gc.collect()
 
     def _ensure_model_loaded(self) -> None:
         """Loads the model if not already loaded."""

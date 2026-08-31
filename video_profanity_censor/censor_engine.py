@@ -42,6 +42,11 @@ class CensorEngine:
     through each component.
     """
 
+    def __init__(self) -> None:
+        # SpeechRecognizer of the current run, kept so that process() can
+        # release its Whisper model once transcription is done
+        self._recognizer = None
+
     def process(
         self,
         input_path: Path,
@@ -80,6 +85,7 @@ class CensorEngine:
         start_time = time.time()
         temp_files: list[Path] = []
         input_path = Path(input_path)
+        self._recognizer = None
 
         # Derive default output path if not specified
         if output_path is None:
@@ -223,6 +229,12 @@ class CensorEngine:
                     active_backend=active_backend,
                     model_size_used=model_size_used,
                 )
+            finally:
+                # The Whisper model holds several GB of RAM and nothing after
+                # transcription needs it, so free it before the remaining
+                # stages — especially the memory-heavy audio censoring
+                if self._recognizer is not None:
+                    self._recognizer.release_model()
             progress_callback(ProcessingStage.TRANSCRIPTION, 100.0, "Transcription complete")
 
             # --- Stage 7: Profanity Detection ---
@@ -399,6 +411,7 @@ class CensorEngine:
             model_size=model_size,
             backend=active_backend,
         )
+        self._recognizer = recognizer
 
         # Determine regions for targeted transcription
         regions = None

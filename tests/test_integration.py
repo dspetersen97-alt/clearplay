@@ -559,3 +559,140 @@ class TestBackendSelectorRAMDetection:
 
         # Even on validation failure, the result is returned
         assert result.success is False
+
+
+class TestWhisperModelReleasedAfterTranscription:
+    """The Whisper model is freed before the stages that follow transcription.
+
+    A medium model holds several GB of RAM, and nothing after transcription
+    needs it, so keeping it loaded through audio censoring and output assembly
+    is what pushed long multichannel films into the OOM killer (Req 9.8).
+    """
+
+    def _run(self, engine, fake_video, fake_output, tmp_dir, validation, extraction,
+             backend, transcription, censor_raises=False):
+        """Runs process() with a recognizer spy and returns the call order."""
+        calls = []
+        recognizer = MagicMock()
+        recognizer.release_model.side_effect = lambda: calls.append("release")
+
+        def transcribe(*args, **kwargs):
+            calls.append("transcribe")
+            engine._recognizer = recognizer
+            return transcription
+
+        def censor(*args, **kwargs):
+            calls.append("censor")
+            if censor_raises:
+                raise RuntimeError("boom")
+            censored_path = tmp_dir / "censored.wav"
+            censored_path.write_bytes(b"censored audio")
+            return CensorResult(
+                censored_audio_path=censored_path,
+                segments_censored=1,
+                total_censored_duration=0.3,
+            )
+
+        assembly_result = AssemblyResult(
+            output_path=fake_output,
+            container_format="mp4",
+            video_stream_copied=True,
+            streams_preserved=0,
+        )
+        fake_output.write_bytes(b"output video")
+
+        with patch.object(engine, "_stage_validate", return_value=validation), \
+             patch.object(engine, "_stage_extract_audio", return_value=extraction), \
+             patch.object(engine, "_stage_detect_backend", return_value=backend), \
+             patch.object(engine, "_stage_scan_subtitles", return_value=SubtitleScanResult(has_subtitles=False)), \
+             patch.object(engine, "_stage_transcribe", side_effect=transcribe), \
+             patch.object(engine, "_stage_censor_audio", side_effect=censor), \
+             patch.object(engine, "_stage_assemble_output", return_value=assembly_result), \
+             patch.object(engine, "_generate_report"), \
+             patch("video_profanity_censor.progress_reporter.ProgressReporter"):
+
+            result = engine.process(input_path=fake_video, output_path=fake_output)
+
+        return calls, result
+
+    def test_model_released_between_transcription_and_censoring(
+        self, engine, fake_video, fake_output, tmp_dir, valid_validation_result,
+        audio_extraction_result, cpu_backend_result, profanity_transcription,
+    ):
+        """The model is released after transcribing and before censoring."""
+        calls, result = self._run(
+            engine, fake_video, fake_output, tmp_dir, valid_validation_result,
+            audio_extraction_result, cpu_backend_result, profanity_transcription,
+        )
+
+        assert result.success is True
+        assert calls == ["transcribe", "release", "censor"]
+
+    def test_model_released_when_a_later_stage_fails(
+        self, engine, fake_video, fake_output, tmp_dir, valid_validation_result,
+        audio_extraction_result, cpu_backend_result, profanity_transcription,
+    ):
+        """A censoring failure still leaves the model released."""
+        calls, result = self._run(
+            engine, fake_video, fake_output, tmp_dir, valid_validation_result,
+            audio_extraction_result, cpu_backend_result, profanity_transcription,
+            censor_raises=True,
+        )
+
+        assert result.success is False
+        assert calls == ["transcribe", "release", "censor"]
+
+    def test_model_released_when_transcription_fails(
+        self, engine, fake_video, fake_output, tmp_dir, valid_validation_result,
+        audio_extraction_result, cpu_backend_result,
+    ):
+        """A transcription failure releases the model it had already loaded."""
+        recognizer = MagicMock()
+
+        def transcribe(*args, **kwargs):
+            engine._recognizer = recognizer
+            raise RuntimeError("transcription exploded")
+
+        with patch.object(engine, "_stage_validate", return_value=valid_validation_result), \
+             patch.object(engine, "_stage_extract_audio", return_value=audio_extraction_result), \
+             patch.object(engine, "_stage_detect_backend", return_value=cpu_backend_result), \
+             patch.object(engine, "_stage_scan_subtitles", return_value=SubtitleScanResult(has_subtitles=False)), \
+             patch.object(engine, "_stage_transcribe", side_effect=transcribe), \
+             patch.object(engine, "_generate_report"), \
+             patch("video_profanity_censor.progress_reporter.ProgressReporter"):
+
+            result = engine.process(input_path=fake_video, output_path=fake_output)
+
+        assert result.success is False
+        assert result.error_stage == ProcessingStage.TRANSCRIPTION
+        recognizer.release_model.assert_called_once()
+
+    def test_stage_transcribe_exposes_its_recognizer(self, engine, tmp_dir):
+        """_stage_transcribe records the recognizer so process() can release it."""
+        audio_path = tmp_dir / "audio.wav"
+        audio_path.write_bytes(b"fake wav data")
+
+        recognizer = MagicMock()
+        recognizer.transcribe.return_value = TranscriptionResult(has_speech=False)
+
+        with patch(
+            "video_profanity_censor.speech_recognizer.SpeechRecognizer",
+            return_value=recognizer,
+        ):
+            engine._stage_transcribe(
+                audio_path, AccelerationBackend.CPU, "medium", None, None
+            )
+
+        assert engine._recognizer is recognizer
+
+    def test_recognizer_is_reset_between_runs(self, engine, fake_video):
+        """A new run does not release a previous run's recognizer."""
+        engine._recognizer = MagicMock()
+
+        with patch.object(engine, "_stage_validate") as mock_validate:
+            mock_validate.return_value = MagicMock(
+                is_valid=False, error_message="test error"
+            )
+            engine.process(input_path=fake_video)
+
+        assert engine._recognizer is None
