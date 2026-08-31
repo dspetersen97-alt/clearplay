@@ -1,0 +1,5 @@
+.kiro/
+.hypothesis/
+video_profanity_censor/__pycache__/
+tests/__pycache__/
+*.pyc
