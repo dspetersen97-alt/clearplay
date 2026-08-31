@@ -1,5 +1,9 @@
 """Audio processing for censoring profane segments using FFmpeg and pydub."""
 
+import gc
+import shutil
+import tempfile
+import wave
 from pathlib import Path
 
 from pydub import AudioSegment
@@ -43,8 +47,11 @@ class AudioProcessor:
     """Replaces profane audio segments with censor tone or silence."""
 
     def __init__(
-        self, mode: CensorMode = CensorMode.MUTE, tone_freq: int = 1000,
-        censor_buffer_ms: int = 100, max_word_duration_ms: int = 750,
+        self,
+        mode: CensorMode = CensorMode.MUTE,
+        tone_freq: int = 1000,
+        censor_buffer_ms: int = 100,
+        max_word_duration_ms: int = 750,
     ):
         """Initialize with censoring mode (TONE or MUTE) and tone frequency.
 
@@ -74,6 +81,9 @@ class AudioProcessor:
     ) -> CensorResult:
         """Applies censoring to detected profanity segments.
 
+        Uses streaming/in-place chunked processing to maintain minimal RAM usage
+        even for multi-gigabyte audio tracks.
+
         Args:
             audio_path: Path to the input audio file (WAV format).
             detections: List of profanity detections with timestamp ranges.
@@ -96,7 +106,6 @@ class AudioProcessor:
 
         if not detections:
             # No profanity detected; copy input to output unchanged
-            import shutil
             shutil.copy2(str(audio_path), str(output_path))
             return CensorResult(
                 censored_audio_path=output_path,
@@ -104,77 +113,253 @@ class AudioProcessor:
                 total_censored_duration=0.0,
             )
 
-        # Load the audio file
-        audio = AudioSegment.from_file(str(audio_path))
+        # Try low-memory streaming WAV processing first
+        export_params = self._build_export_params(audio_metadata)
+        is_wav_export = export_params.get("format") == "wav"
 
-        # Sort detections by start time
+        try:
+            target_wav_path = output_path if is_wav_export else Path(
+                tempfile.mktemp(suffix=".wav", prefix="censored_stream_")
+            )
+            result = self._censor_wav_stream(
+                audio_path=audio_path,
+                detections=detections,
+                output_path=target_wav_path,
+                progress_callback=progress_callback,
+            )
+
+            if not is_wav_export:
+                # Re-encode to requested format using pydub
+                audio = AudioSegment.from_file(str(target_wav_path))
+                audio.export(str(output_path), **export_params)
+                del audio
+                if target_wav_path.exists():
+                    target_wav_path.unlink()
+                gc.collect()
+
+            return result
+        except Exception:
+            # Fall back to in-place bytearray processing if wave module cannot handle
+            return self._censor_inplace(
+                audio_path=audio_path,
+                detections=detections,
+                output_path=output_path,
+                export_params=export_params,
+                progress_callback=progress_callback,
+            )
+
+    def _censor_wav_stream(
+        self,
+        audio_path: Path,
+        detections: list[Detection],
+        output_path: Path,
+        progress_callback: ProgressCallback = None,
+    ) -> CensorResult:
+        """Processes WAV files using streaming I/O with constant minimal RAM usage."""
         sorted_detections = sorted(
             detections, key=lambda d: d.timestamp_range.start
         )
+        crossfade_ms = 10
 
-        total_censored_duration = 0.0
-        crossfade_ms = 10  # 10ms crossfade at boundaries
+        with wave.open(str(audio_path), "rb") as in_wav:
+            params = in_wav.getparams()
+            nchannels = params.nchannels
+            sampwidth = params.sampwidth
+            framerate = params.framerate
+            nframes = params.nframes
+            frame_width = nchannels * sampwidth
+            audio_duration_ms = int(nframes * 1000.0 / framerate) if framerate > 0 else 0
+
+            # Pre-compute replacement buffers and frame ranges
+            replacements: list[tuple[int, int, bytes]] = []
+            total_censored_duration = 0.0
+
+            for detection in sorted_detections:
+                start_ms = int(detection.timestamp_range.start * 1000) - self.censor_buffer_ms
+                end_ms = int(detection.timestamp_range.end * 1000) + self.censor_buffer_ms
+
+                if self.max_word_duration_ms > 0:
+                    raw_duration = end_ms - start_ms
+                    if raw_duration > self.max_word_duration_ms:
+                        start_ms = end_ms - self.max_word_duration_ms
+
+                start_ms = max(0, start_ms)
+                end_ms = min(end_ms, audio_duration_ms)
+                duration_ms = end_ms - start_ms
+
+                if duration_ms <= 0:
+                    continue
+
+                if self.mode == CensorMode.TONE:
+                    replacement = self._generate_tone(
+                        duration_ms=duration_ms,
+                        sample_rate=framerate,
+                        channels=nchannels,
+                    )
+                else:
+                    replacement = AudioSegment.silent(
+                        duration=duration_ms,
+                        frame_rate=framerate,
+                    )
+                    if nchannels > 1 and replacement.channels == 1:
+                        replacement = replacement.set_channels(nchannels)
+
+                if replacement.sample_width != sampwidth:
+                    replacement = replacement.set_sample_width(sampwidth)
+
+                replacement = self._apply_crossfade(
+                    None, replacement, start_ms, end_ms, crossfade_ms
+                )
+
+                start_frame = int(start_ms * framerate / 1000.0)
+                rep_data = replacement.raw_data
+                rep_nframes = len(rep_data) // frame_width
+                end_frame = min(nframes, start_frame + rep_nframes)
+                replacements.append((start_frame, end_frame, rep_data))
+
+                total_censored_duration += duration_ms / 1000.0
+
+            with wave.open(str(output_path), "wb") as out_wav:
+                out_wav.setparams(params)
+                chunk_size_frames = 65536  # ~1.4s of 48kHz audio (~256KB-1MB buffer)
+                frames_read = 0
+
+                while frames_read < nframes:
+                    to_read = min(chunk_size_frames, nframes - frames_read)
+                    data = in_wav.readframes(to_read)
+                    chunk_start = frames_read
+                    chunk_end = frames_read + to_read
+
+                    chunk_buf = None
+                    for s_f, e_f, rep_data in replacements:
+                        if s_f < chunk_end and e_f > chunk_start:
+                            if chunk_buf is None:
+                                chunk_buf = bytearray(data)
+
+                            ov_start = max(chunk_start, s_f)
+                            ov_end = min(chunk_end, e_f)
+
+                            c_byte_s = (ov_start - chunk_start) * frame_width
+                            c_byte_e = (ov_end - chunk_start) * frame_width
+
+                            r_byte_s = (ov_start - s_f) * frame_width
+                            r_byte_e = r_byte_s + (c_byte_e - c_byte_s)
+
+                            chunk_buf[c_byte_s:c_byte_e] = rep_data[r_byte_s:r_byte_e]
+
+                    if chunk_buf is not None:
+                        out_wav.writeframes(chunk_buf)
+                    else:
+                        out_wav.writeframes(data)
+
+                    frames_read += to_read
+
+                    if progress_callback and nframes > 0:
+                        percent = (frames_read / nframes) * 100.0
+                        progress_callback(
+                            ProcessingStage.AUDIO_CENSORING,
+                            percent,
+                            f"Censoring audio: {percent:.0f}%",
+                        )
+
+        gc.collect()
+        return CensorResult(
+            censored_audio_path=output_path,
+            segments_censored=len(sorted_detections),
+            total_censored_duration=total_censored_duration,
+        )
+
+    def _censor_inplace(
+        self,
+        audio_path: Path,
+        detections: list[Detection],
+        output_path: Path,
+        export_params: dict,
+        progress_callback: ProgressCallback = None,
+    ) -> CensorResult:
+        """In-place bytearray fallback when streaming wave is not possible."""
+        audio = AudioSegment.from_file(str(audio_path))
+        frame_rate = audio.frame_rate
+        channels = audio.channels
+        sample_width = audio.sample_width
+        frame_width = audio.frame_width
         audio_duration_ms = len(audio)
 
-        for detection in sorted_detections:
+        raw_data = bytearray(audio.raw_data)
+        del audio
+        gc.collect()
+
+        sorted_detections = sorted(
+            detections, key=lambda d: d.timestamp_range.start
+        )
+        total_censored_duration = 0.0
+        crossfade_ms = 10
+
+        for idx, detection in enumerate(sorted_detections):
             start_ms = int(detection.timestamp_range.start * 1000) - self.censor_buffer_ms
             end_ms = int(detection.timestamp_range.end * 1000) + self.censor_buffer_ms
 
-            # Cap word duration to avoid overly long mutes from imprecise Whisper timestamps.
-            # When Whisper assigns too-long durations, the actual word is typically at the END
-            # of the range (Whisper anchors the start too early), so we trim from the start.
             if self.max_word_duration_ms > 0:
                 raw_duration = end_ms - start_ms
                 if raw_duration > self.max_word_duration_ms:
-                    # Keep the end, trim the start — the word is spoken near the end
                     start_ms = end_ms - self.max_word_duration_ms
 
-            # Clamp to audio boundaries
             start_ms = max(0, start_ms)
             end_ms = min(end_ms, audio_duration_ms)
-
             duration_ms = end_ms - start_ms
 
             if duration_ms <= 0:
                 continue
 
-            # Generate replacement audio
             if self.mode == CensorMode.TONE:
                 replacement = self._generate_tone(
                     duration_ms=duration_ms,
-                    sample_rate=audio.frame_rate,
-                    channels=audio.channels,
+                    sample_rate=frame_rate,
+                    channels=channels,
                 )
             else:
                 replacement = AudioSegment.silent(
                     duration=duration_ms,
-                    frame_rate=audio.frame_rate,
+                    frame_rate=frame_rate,
                 )
-                # Match channels
-                if audio.channels > 1 and replacement.channels == 1:
-                    replacement = replacement.set_channels(audio.channels)
+                if channels > 1 and replacement.channels == 1:
+                    replacement = replacement.set_channels(channels)
 
-            # Apply crossfade at boundaries
+            if replacement.sample_width != sample_width:
+                replacement = replacement.set_sample_width(sample_width)
+
             replacement = self._apply_crossfade(
-                audio, replacement, start_ms, end_ms, crossfade_ms
+                None, replacement, start_ms, end_ms, crossfade_ms
             )
 
-            # Replace the segment in the audio
-            audio = audio[:start_ms] + replacement + audio[end_ms:]
+            start_sample = int(start_ms * frame_rate / 1000.0)
+            start_byte = start_sample * frame_width
+            rep_bytes = replacement.raw_data
+            end_byte = min(len(raw_data), start_byte + len(rep_bytes))
+            raw_data[start_byte:end_byte] = rep_bytes[:end_byte - start_byte]
 
             total_censored_duration += duration_ms / 1000.0
 
             if progress_callback:
-                progress = (sorted_detections.index(detection) + 1) / len(sorted_detections)
+                progress = (idx + 1) / len(sorted_detections)
                 progress_callback(
                     ProcessingStage.AUDIO_CENSORING,
                     progress * 100,
-                    f"Censored segment {sorted_detections.index(detection) + 1}/{len(sorted_detections)}",
+                    f"Censored segment {idx + 1}/{len(sorted_detections)}",
                 )
 
-        # Export the censored audio
-        export_params = self._build_export_params(audio_metadata)
-        audio.export(str(output_path), **export_params)
+        censored_audio = AudioSegment(
+            data=bytes(raw_data),
+            sample_width=sample_width,
+            frame_rate=frame_rate,
+            channels=channels,
+        )
+        del raw_data
+        gc.collect()
+
+        censored_audio.export(str(output_path), **export_params)
+        del censored_audio
+        gc.collect()
 
         return CensorResult(
             censored_audio_path=output_path,
@@ -307,7 +492,7 @@ class AudioProcessor:
 
     def _apply_crossfade(
         self,
-        original: AudioSegment,
+        original: AudioSegment | None,
         replacement: AudioSegment,
         start_ms: int,
         end_ms: int,
@@ -319,7 +504,7 @@ class AudioProcessor:
         to avoid audible clicks or pops.
 
         Args:
-            original: The full original audio.
+            original: The full original audio (optional, unused).
             replacement: The replacement segment (tone or silence).
             start_ms: Start position in milliseconds.
             end_ms: End position in milliseconds.

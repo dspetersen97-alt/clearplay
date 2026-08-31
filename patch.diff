@@ -1,0 +1,199 @@
+diff --git a/tests/test_input_validator.py b/tests/test_input_validator.py
+index e9b2366..7d068a8 100644
+--- a/tests/test_input_validator.py
++++ b/tests/test_input_validator.py
+@@ -86,6 +86,7 @@ class TestFileSizeExceedsLimit:
+         # Mock stat to report a size over 50 GB
+         oversized = InputValidator.MAX_FILE_SIZE_BYTES + 1
+         with patch.object(Path, "stat") as mock_stat:
++            mock_stat.return_value.st_mode = 0o100644
+             mock_stat.return_value.st_size = oversized
+             result = validator.validate(large_file)
+ 
+@@ -109,6 +110,7 @@ class TestFileSizeExceedsLimit:
+         }
+         with patch.object(Path, "stat") as mock_stat, \
+              patch("video_profanity_censor.input_validator.ffmpeg.probe", return_value=probe_result):
++            mock_stat.return_value.st_mode = 0o100644
+             mock_stat.return_value.st_size = exactly_50gb
+             result = validator.validate(file_at_limit)
+ 
+@@ -132,6 +134,7 @@ class TestNoAudioTrack:
+         }
+         with patch.object(Path, "stat") as mock_stat, \
+              patch("video_profanity_censor.input_validator.ffmpeg.probe", return_value=probe_result):
++            mock_stat.return_value.st_mode = 0o100644
+             mock_stat.return_value.st_size = 1024 * 1024  # 1 MB
+             result = validator.validate(video_file)
+ 
+@@ -151,6 +154,7 @@ class TestNoAudioTrack:
+         }
+         with patch.object(Path, "stat") as mock_stat, \
+              patch("video_profanity_censor.input_validator.ffmpeg.probe", return_value=probe_result):
++            mock_stat.return_value.st_mode = 0o100644
+             mock_stat.return_value.st_size = 5 * 1024 * 1024
+             result = validator.validate(video_file)
+ 
+@@ -171,6 +175,7 @@ class TestCorruptContainer:
+         with patch.object(Path, "stat") as mock_stat, \
+              patch("video_profanity_censor.input_validator.ffmpeg.probe",
+                    side_effect=ffmpeg_lib.Error("ffprobe", b"", b"Invalid data")):
++            mock_stat.return_value.st_mode = 0o100644
+             mock_stat.return_value.st_size = 1024 * 1024
+             result = validator.validate(corrupt_file)
+ 
+@@ -187,6 +192,7 @@ class TestCorruptContainer:
+         with patch.object(Path, "stat") as mock_stat, \
+              patch("video_profanity_censor.input_validator.ffmpeg.probe",
+                    side_effect=ffmpeg_lib.Error("ffprobe", b"", b"Error")):
++            mock_stat.return_value.st_mode = 0o100644
+             mock_stat.return_value.st_size = 2 * 1024 * 1024
+             result = validator.validate(corrupt_file)
+ 
+diff --git a/video_profanity_censor/audio_processor.py b/video_profanity_censor/audio_processor.py
+index 46acde4..4c139a2 100644
+--- a/video_profanity_censor/audio_processor.py
++++ b/video_profanity_censor/audio_processor.py
+@@ -116,6 +116,7 @@ class AudioProcessor:
+         crossfade_ms = 10  # 10ms crossfade at boundaries
+         audio_duration_ms = len(audio)
+ 
++        intervals = []
+         for detection in sorted_detections:
+             start_ms = int(detection.timestamp_range.start * 1000) - self.censor_buffer_ms
+             end_ms = int(detection.timestamp_range.end * 1000) + self.censor_buffer_ms
+@@ -138,39 +139,64 @@ class AudioProcessor:
+             if duration_ms <= 0:
+                 continue
+ 
+-            # Generate replacement audio
+-            if self.mode == CensorMode.TONE:
+-                replacement = self._generate_tone(
+-                    duration_ms=duration_ms,
+-                    sample_rate=audio.frame_rate,
+-                    channels=audio.channels,
+-                )
+-            else:
+-                replacement = AudioSegment.silent(
+-                    duration=duration_ms,
+-                    frame_rate=audio.frame_rate,
+-                )
+-                # Match channels
+-                if audio.channels > 1 and replacement.channels == 1:
+-                    replacement = replacement.set_channels(audio.channels)
+-
+-            # Apply crossfade at boundaries
+-            replacement = self._apply_crossfade(
+-                audio, replacement, start_ms, end_ms, crossfade_ms
+-            )
+-
+-            # Replace the segment in the audio
+-            audio = audio[:start_ms] + replacement + audio[end_ms:]
+-
++            intervals.append((start_ms, end_ms))
+             total_censored_duration += duration_ms / 1000.0
+ 
+-            if progress_callback:
+-                progress = (sorted_detections.index(detection) + 1) / len(sorted_detections)
+-                progress_callback(
+-                    ProcessingStage.AUDIO_CENSORING,
+-                    progress * 100,
+-                    f"Censored segment {sorted_detections.index(detection) + 1}/{len(sorted_detections)}",
++        if intervals:
++            merged_intervals = []
++            for start_ms, end_ms in sorted(intervals, key=lambda x: x[0]):
++                if not merged_intervals:
++                    merged_intervals.append([start_ms, end_ms])
++                else:
++                    last = merged_intervals[-1]
++                    if start_ms <= last[1]:
++                        last[1] = max(last[1], end_ms)
++                    else:
++                        merged_intervals.append([start_ms, end_ms])
++
++            parts = []
++            current_ms = 0
++            for i, (start_ms, end_ms) in enumerate(merged_intervals):
++                if start_ms > current_ms:
++                    parts.append(audio[current_ms:start_ms])
++
++                duration_ms = end_ms - start_ms
++                if self.mode == CensorMode.TONE:
++                    replacement = self._generate_tone(
++                        duration_ms=duration_ms,
++                        sample_rate=audio.frame_rate,
++                        channels=audio.channels,
++                    )
++                else:
++                    replacement = AudioSegment.silent(
++                        duration=duration_ms,
++                        frame_rate=audio.frame_rate,
++                    )
++                    # Match channels
++                    if audio.channels > 1 and replacement.channels == 1:
++                        replacement = replacement.set_channels(audio.channels)
++
++                # Apply crossfade at boundaries
++                replacement = self._apply_crossfade(
++                    audio, replacement, start_ms, end_ms, crossfade_ms
+                 )
++                parts.append(replacement)
++                current_ms = end_ms
++
++                if progress_callback:
++                    progress = (i + 1) / len(merged_intervals)
++                    progress_callback(
++                        ProcessingStage.AUDIO_CENSORING,
++                        progress * 100,
++                        f"Censored segment {i + 1}/{len(merged_intervals)}",
++                    )
++
++            if current_ms < audio_duration_ms:
++                parts.append(audio[current_ms:])
++
++            if parts:
++                final_data = b"".join(part.raw_data for part in parts)
++                audio = audio._spawn(final_data)
+ 
+         # Export the censored audio
+         export_params = self._build_export_params(audio_metadata)
+diff --git a/video_profanity_censor/speech_recognizer.py b/video_profanity_censor/speech_recognizer.py
+index 2603207..9c212dd 100644
+--- a/video_profanity_censor/speech_recognizer.py
++++ b/video_profanity_censor/speech_recognizer.py
+@@ -79,10 +79,22 @@ class SpeechRecognizer:
+         # Load the model
+         self._ensure_model_loaded()
+ 
+-        if regions:
+-            return self._transcribe_regions(audio_path, regions, progress_callback)
+-        else:
+-            return self._transcribe_full(audio_path, progress_callback)
++        try:
++            if regions:
++                return self._transcribe_regions(audio_path, regions, progress_callback)
++            else:
++                return self._transcribe_full(audio_path, progress_callback)
++        finally:
++            self.unload_model()
++
++    def unload_model(self) -> None:
++        """Unloads the model from memory and forces garbage collection."""
++        if self._model is not None:
++            import gc
++            if "whisper_model" in self._model:
++                del self._model["whisper_model"]
++            self._model = None
++            gc.collect()
+ 
+     def _ensure_model_loaded(self) -> None:
+         """Loads the model if not already loaded."""
+@@ -347,6 +359,8 @@ class SpeechRecognizer:
+                 os.unlink(tmp_path)
+             except OSError:
+                 pass
++            import gc
++            gc.collect()
+ 
+     def _run_transcription(
+         self,

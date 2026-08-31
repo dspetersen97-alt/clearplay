@@ -4,6 +4,7 @@ import logging
 import platform
 import subprocess
 import sys
+from pathlib import Path
 
 from video_profanity_censor.models import (
     AccelerationBackend,
@@ -97,6 +98,26 @@ class BackendSelector:
             try:
                 import os
                 mem_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+
+                # Check for cgroup memory limits (e.g. Linux containers)
+                cgroup_v2 = Path("/sys/fs/cgroup/memory.max")
+                if cgroup_v2.exists():
+                    try:
+                        val = cgroup_v2.read_text().strip()
+                        if val and val != "max" and val.isdigit():
+                            mem_bytes = min(mem_bytes, int(val))
+                    except (OSError, ValueError):
+                        pass
+
+                cgroup_v1 = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+                if cgroup_v1.exists():
+                    try:
+                        val = cgroup_v1.read_text().strip()
+                        if val and val.isdigit() and int(val) < 0x7FFFFFFFFFFFF000:
+                            mem_bytes = min(mem_bytes, int(val))
+                    except (OSError, ValueError):
+                        pass
+
                 return mem_bytes // (1024 * 1024)
             except (ValueError, OSError, AttributeError) as e:
                 logger.warning(f"Failed to query system RAM: {e}")

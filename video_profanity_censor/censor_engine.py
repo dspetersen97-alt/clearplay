@@ -224,6 +224,8 @@ class CensorEngine:
                     model_size_used=model_size_used,
                 )
             progress_callback(ProcessingStage.TRANSCRIPTION, 100.0, "Transcription complete")
+            import gc
+            gc.collect()
 
             # --- Stage 7: Profanity Detection ---
             progress_callback(ProcessingStage.PROFANITY_DETECTION, 0.0, "Detecting profanity...")
@@ -405,11 +407,17 @@ class CensorEngine:
         if subtitle_scan_result is not None and subtitle_scan_result.profanity_regions:
             regions = subtitle_scan_result.profanity_regions
 
-        return recognizer.transcribe(
-            audio_path=audio_path,
-            regions=regions,
-            progress_callback=progress_callback,
-        )
+        try:
+            return recognizer.transcribe(
+                audio_path=audio_path,
+                regions=regions,
+                progress_callback=progress_callback,
+            )
+        finally:
+            recognizer.unload_model()
+            del recognizer
+            import gc
+            gc.collect()
 
     def _stage_detect_profanity(
         self,

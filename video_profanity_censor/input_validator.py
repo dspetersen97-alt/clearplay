@@ -28,13 +28,23 @@ class InputValidator:
             or is_valid=False with an error_message on failure.
         """
         # Check file existence and accessibility
-        if not file_path.exists():
+        try:
+            exists = file_path.exists()
+        except TypeError:
+            exists = os.path.exists(file_path)
+
+        if not exists:
             return ValidationResult(
                 is_valid=False,
                 error_message=f"File not found: '{file_path}'",
             )
 
-        if not file_path.is_file():
+        try:
+            is_file = file_path.is_file()
+        except TypeError:
+            is_file = os.path.isfile(file_path)
+
+        if not is_file:
             return ValidationResult(
                 is_valid=False,
                 error_message=f"Path is not a file: '{file_path}'",

@@ -51,6 +51,12 @@ class SpeechRecognizer:
         """The acceleration backend being used."""
         return self._backend
 
+    def unload_model(self) -> None:
+        """Unload the Whisper model and release allocated memory."""
+        self._model = None
+        import gc
+        gc.collect()
+
     def transcribe(
         self,
         audio_path: Path,
