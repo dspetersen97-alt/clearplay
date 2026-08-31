@@ -920,3 +920,242 @@ class TestBoundedMemorySinglePassCensoring:
                 "This indicates censor() rebuilds the full buffer once per "
                 "detection, driving the OOM."
             )
+
+
+# ============================================================================
+# Property 2: Preservation - Behavioral equivalence after the FFmpeg migration
+# ============================================================================
+#
+# WHY THESE ASSERTIONS ARE BEHAVIORAL, NOT BYTE-FOR-BYTE
+# ------------------------------------------------------
+# The OOM fix rebuilds AudioProcessor.censor() to drive a single FFmpeg
+# filtergraph (streaming input -> output) instead of loading the entire decoded
+# PCM into a pydub AudioSegment and stitching it in Python. This keeps peak
+# memory independent of track length (the fix for the swap/OOM crash on long
+# multichannel films).
+#
+# A consequence is that the exact sample values inside CENSORED regions are no
+# longer produced by pydub's Sine generator / AudioSegment.silent + fade math;
+# they are produced by FFmpeg's sine source, volume gating, amix, and afade.
+# The silence/tone is equivalent in behavior but NOT guaranteed byte-identical
+# to the old pydub output. Byte-for-byte equivalence against the removed pydub
+# implementation is therefore infeasible and would be a false regression signal.
+#
+# These tests assert the behaviors the spec requires to be preserved (design
+# Property 2 / Requirements 3.1-3.5), expressed at the observable level:
+#   (a) output duration matches input duration,
+#   (b) censored regions are effectively silenced (MUTE: RMS ~ 0) or toned
+#       (TONE: dominant frequency ~= tone_freq),
+#   (c) non-censored regions are sample-equivalent to the source,
+#   (d) CensorResult.segments_censored and total_censored_duration are unchanged,
+#   (e) zero-detection passthrough is unchanged.
+# The window math (buffer, cap "trim from start", clamping) and export-parameter
+# mapping are unchanged in the source and are covered by the other test classes
+# in this file (channel-layout preservation, encoding-parameter properties).
+
+import numpy as np
+
+
+def _dominant_frequency(samples: np.ndarray, sample_rate: int) -> float:
+    """Return the dominant frequency (Hz) of a 1-D real signal via FFT."""
+    if len(samples) < 4:
+        return 0.0
+    windowed = samples.astype(float) * np.hanning(len(samples))
+    spectrum = np.abs(np.fft.rfft(windowed))
+    freqs = np.fft.rfftfreq(len(samples), 1.0 / sample_rate)
+    return float(freqs[int(np.argmax(spectrum))])
+
+
+def _channel_0(audio: AudioSegment) -> np.ndarray:
+    """Return channel-0 samples of an AudioSegment as a 1-D numpy array."""
+    data = np.array(audio.get_array_of_samples())
+    if audio.channels > 1:
+        data = data.reshape(-1, audio.channels)[:, 0]
+    return data
+
+
+class TestCensorBehavioralPreservation:
+    """Property 2: Preservation - behavioral equivalence for non-buggy inputs.
+
+    See the module-level note above for why equivalence is asserted behaviorally
+    rather than byte-for-byte (the FFmpeg streaming migration changes exact sample
+    values inside censored regions but preserves observable behavior).
+
+    **Validates: Requirements 3.1, 3.2, 3.3, 3.4, 3.5**
+    """
+
+    SAMPLE_RATE = 48000
+    DURATION_MS = 3000
+    TONE_FREQ = 1000
+
+    def _make_source(self, channels: int) -> AudioSegment:
+        return _create_test_audio(
+            channels=channels,
+            sample_rate=self.SAMPLE_RATE,
+            duration_ms=self.DURATION_MS,
+        )
+
+    @given(channels=channel_counts, mode=censor_modes)
+    @settings(max_examples=20, deadline=30000)
+    def test_output_duration_matches_input(self, channels: int, mode: CensorMode):
+        """(a) Output duration equals input duration."""
+        source = self._make_source(channels)
+        detection = Detection(
+            word="x",
+            timestamp_range=TimestampRange(start=1.0, end=1.4),
+            censor_action=mode,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src.wav"
+            out = Path(tmp) / "out.wav"
+            source.export(str(src), format="wav")
+
+            AudioProcessor(mode=mode, tone_freq=self.TONE_FREQ).censor(
+                audio_path=src, detections=[detection], output_path=out
+            )
+
+            output = AudioSegment.from_file(str(out))
+            # Allow a 1-frame rounding tolerance from resample-free re-encode.
+            assert abs(len(output) - len(source)) <= 2, (
+                f"Output duration {len(output)}ms differs from input {len(source)}ms"
+            )
+
+    @given(channels=channel_counts)
+    @settings(max_examples=20, deadline=30000)
+    def test_mute_region_is_silenced(self, channels: int):
+        """(b) MUTE: censored region RMS is near zero."""
+        source = self._make_source(channels)
+        detection = Detection(
+            word="x",
+            timestamp_range=TimestampRange(start=1.0, end=1.5),
+            censor_action=CensorMode.MUTE,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src.wav"
+            out = Path(tmp) / "out.wav"
+            source.export(str(src), format="wav")
+
+            AudioProcessor(mode=CensorMode.MUTE).censor(
+                audio_path=src, detections=[detection], output_path=out
+            )
+
+            output = AudioSegment.from_file(str(out))
+            sr = output.frame_rate
+            sig = _channel_0(output)
+            # Sample well inside the censored window to avoid boundary effects.
+            region = sig[int(1.05 * sr):int(1.45 * sr)]
+            rms = float(np.sqrt(np.mean(region.astype(float) ** 2)))
+            assert rms < 5.0, f"MUTE region not silenced (RMS={rms})"
+
+    @given(channels=channel_counts)
+    @settings(max_examples=20, deadline=30000)
+    def test_tone_region_dominant_frequency_matches(self, channels: int):
+        """(b) TONE: censored region's dominant frequency ~= tone_freq."""
+        source = self._make_source(channels)
+        detection = Detection(
+            word="x",
+            timestamp_range=TimestampRange(start=1.0, end=1.5),
+            censor_action=CensorMode.TONE,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src.wav"
+            out = Path(tmp) / "out.wav"
+            source.export(str(src), format="wav")
+
+            AudioProcessor(mode=CensorMode.TONE, tone_freq=self.TONE_FREQ).censor(
+                audio_path=src, detections=[detection], output_path=out
+            )
+
+            output = AudioSegment.from_file(str(out))
+            sr = output.frame_rate
+            sig = _channel_0(output)
+            region = sig[int(1.05 * sr):int(1.45 * sr)]
+            dom = _dominant_frequency(region, sr)
+            assert abs(dom - self.TONE_FREQ) <= 30.0, (
+                f"TONE region dominant frequency {dom}Hz != {self.TONE_FREQ}Hz"
+            )
+
+    @given(channels=channel_counts, mode=censor_modes)
+    @settings(max_examples=20, deadline=30000)
+    def test_non_censored_region_is_sample_equivalent(
+        self, channels: int, mode: CensorMode
+    ):
+        """(c) Non-censored regions are sample-equivalent to the source."""
+        source = self._make_source(channels)
+        detection = Detection(
+            word="x",
+            timestamp_range=TimestampRange(start=1.0, end=1.5),
+            censor_action=mode,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src.wav"
+            out = Path(tmp) / "out.wav"
+            source.export(str(src), format="wav")
+
+            AudioProcessor(mode=mode, tone_freq=self.TONE_FREQ).censor(
+                audio_path=src, detections=[detection], output_path=out
+            )
+
+            output = AudioSegment.from_file(str(out))
+            src_seg = AudioSegment.from_file(str(src))
+            sr = output.frame_rate
+            out_sig = _channel_0(output).astype(float)
+            src_sig = _channel_0(src_seg).astype(float)
+
+            # Region safely before the censored window (with crossfade headroom).
+            end = int(0.9 * sr)
+            n = min(end, len(out_sig), len(src_sig))
+            max_diff = float(np.max(np.abs(out_sig[:n] - src_sig[:n]))) if n else 0.0
+            assert max_diff == 0.0, (
+                f"Non-censored region altered (max sample diff={max_diff}, mode={mode.value})"
+            )
+
+    @given(mode=censor_modes)
+    @settings(max_examples=10, deadline=30000)
+    def test_result_accounting_unchanged(self, mode: CensorMode):
+        """(d) segments_censored and total_censored_duration match the window math."""
+        source = self._make_source(2)
+        # Two non-overlapping detections, 0.4s each => buffer +/-100ms => 0.6s each.
+        detections = [
+            Detection(
+                word="a",
+                timestamp_range=TimestampRange(start=0.5, end=0.9),
+                censor_action=mode,
+            ),
+            Detection(
+                word="b",
+                timestamp_range=TimestampRange(start=1.8, end=2.2),
+                censor_action=mode,
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src.wav"
+            out = Path(tmp) / "out.wav"
+            source.export(str(src), format="wav")
+
+            result = AudioProcessor(mode=mode).censor(
+                audio_path=src, detections=detections, output_path=out
+            )
+
+            assert result.segments_censored == 2
+            # Each window: (end+0.1) - (start-0.1) = 0.6s, capped is not triggered.
+            # Cap default is 750ms; 0.6s < 0.75s so no trimming.
+            assert abs(result.total_censored_duration - 1.2) < 1e-6, (
+                f"total_censored_duration={result.total_censored_duration}, expected 1.2"
+            )
+
+    def test_zero_detection_passthrough_unchanged(self):
+        """(e) Zero detections copies input to output unchanged; segments_censored == 0."""
+        source = self._make_source(2)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src.wav"
+            out = Path(tmp) / "out.wav"
+            source.export(str(src), format="wav")
+
+            result = AudioProcessor(mode=CensorMode.MUTE).censor(
+                audio_path=src, detections=[], output_path=out
+            )
+
+            assert result.segments_censored == 0
+            assert result.total_censored_duration == 0.0
+            assert out.read_bytes() == src.read_bytes(), "Passthrough copy differs from input"
