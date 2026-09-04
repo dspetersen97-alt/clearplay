@@ -37,32 +37,11 @@ These steps get the app installed from a fresh clone. Run them from the project 
 ### 1. Get the code
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/dspetersen97-alt/clearplay.git
 cd clearplay
 ```
 
-### 2. Create and activate a virtual environment
-
-A virtual environment keeps the app's dependencies isolated from your system Python.
-
-**Windows (PowerShell):**
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-
-> If activation is blocked by execution policy, run once:
-> `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned`
-
-**macOS / Linux:**
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-### 3. Install the application
+### 2. Install the application
 
 Install it as an editable package. This also registers the `video-profanity-censor` command:
 
@@ -76,7 +55,7 @@ To include the development tools (pytest, hypothesis, coverage), install the `de
 pip install -e ".[dev]"
 ```
 
-### 4. Verify the install
+### 3. Verify the install
 
 ```bash
 video-profanity-censor --help
@@ -92,7 +71,7 @@ The app can be used from the command line or through a desktop GUI.
 
 ### Graphical interface (GUI)
 
-A Tkinter-based desktop GUI is included for users who prefer not to use the command line. Launch it with:
+A Tkinter-based desktop GUI is included. Launch it with:
 
 ```bash
 video-profanity-censor-gui
