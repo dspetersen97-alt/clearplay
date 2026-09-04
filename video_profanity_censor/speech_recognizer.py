@@ -18,6 +18,39 @@ from video_profanity_censor.models import (
 logger = logging.getLogger(__name__)
 
 
+def _has_valid_timing(start, end) -> bool:
+    """Return True if a word's start/end timestamps are usable.
+
+    faster-whisper can occasionally emit ``None`` timestamps or a non-positive
+    duration (``end <= start``), especially on the final word of a segment.
+    Such words must not become censor windows: downstream, an ``end`` that is
+    missing or overruns gets clamped to the full track duration, which mutes
+    everything after the word to the end of the file. Rejecting them here keeps
+    those bad values out of the pipeline entirely.
+
+    Args:
+        start: Word start time in seconds (or None).
+        end: Word end time in seconds (or None).
+
+    Returns:
+        True if both timestamps are present, finite, non-negative, and end > start.
+    """
+    import math
+
+    if start is None or end is None:
+        return False
+    try:
+        start_f = float(start)
+        end_f = float(end)
+    except (TypeError, ValueError):
+        return False
+    if not (math.isfinite(start_f) and math.isfinite(end_f)):
+        return False
+    if start_f < 0 or end_f <= start_f:
+        return False
+    return True
+
+
 class SpeechRecognizer:
     """Transcribes audio to text with word-level timestamps using Whisper.
 
@@ -444,6 +477,17 @@ class SpeechRecognizer:
                     # Skip words with very low confidence or empty text
                     word_text = word_info.word.strip()
                     if not word_text:
+                        continue
+
+                    # Skip words with missing or invalid timestamps. A None or
+                    # non-positive-duration end would otherwise be clamped to the
+                    # full track duration downstream and mute to end-of-file.
+                    if not _has_valid_timing(word_info.start, word_info.end):
+                        logger.warning(
+                            "Skipping word %r with invalid timing "
+                            "(start=%r, end=%r)",
+                            word_text, word_info.start, word_info.end,
+                        )
                         continue
 
                     words.append(
