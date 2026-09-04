@@ -1,0 +1,18 @@
+Metadata-Version: 2.4
+Name: video-profanity-censor
+Version: 0.1.0
+Summary: A CLI application for detecting and censoring profanity in video files
+License: MIT
+Requires-Python: >=3.11
+License-File: LICENSE
+Requires-Dist: openai-whisper>=20231117
+Requires-Dist: onnxruntime-directml>=1.16.0
+Requires-Dist: faster-whisper>=1.0.0
+Requires-Dist: ffmpeg-python>=0.2.0
+Requires-Dist: pydub>=0.25.1
+Requires-Dist: nltk>=3.8.1
+Provides-Extra: dev
+Requires-Dist: hypothesis>=6.92.0; extra == "dev"
+Requires-Dist: pytest>=7.4.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.1.0; extra == "dev"
+Dynamic: license-file

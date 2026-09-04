@@ -28,6 +28,9 @@ dev = [
 [project.scripts]
 video-profanity-censor = "video_profanity_censor.cli:main"
 
+[project.gui-scripts]
+video-profanity-censor-gui = "video_profanity_censor.gui:main"
+
 [tool.setuptools.packages.find]
 include = ["video_profanity_censor*"]
 

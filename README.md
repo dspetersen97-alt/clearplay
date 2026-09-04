@@ -88,6 +88,35 @@ You should see the usage help. You can also run it as a module: `python -m video
 
 ## Usage
 
+The app can be used from the command line or through a desktop GUI.
+
+### Graphical interface (GUI)
+
+A Tkinter-based desktop GUI is included for users who prefer not to use the command line. Launch it with:
+
+```bash
+video-profanity-censor-gui
+```
+
+Or run it as a module:
+
+```bash
+python -m video_profanity_censor.gui
+```
+
+The GUI lets you:
+
+- **Select the source video** with a file picker (filtered to supported formats).
+- **Select an external subtitle file** (SRT/ASS/SSA), optional. If you leave it blank, the app automatically checks the video for **embedded subtitle tracks**, same as the CLI.
+- **Choose the censor mode** — mute (silence) or tone (beep).
+- **Choose the output path**, optional (defaults to `<input>_censored.<ext>`).
+- **Check dependencies** with a single button that verifies FFmpeg is on your `PATH` and that all required Python packages are installed.
+- **Run** the pipeline with a live progress bar and log. Processing runs on a background thread so the window stays responsive.
+
+Tkinter ships with the Python standard library, so the GUI adds no extra dependencies. On some Linux distributions you may need to install it separately (e.g. `sudo apt install python3-tk`).
+
+### Command-line usage
+
 The only required argument is the path to a video file. By default the app mutes profanity and writes a new file next to the input.
 
 ### Basic example
