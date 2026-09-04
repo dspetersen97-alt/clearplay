@@ -150,14 +150,14 @@ class TestMuteDoesNotRunToEndOfFile:
             # mute was anchored to the START and capped, not run out to the raw end.
             assert _rms_between(out, 3_000, 4_800) > 0
 
-    def test_implausibly_long_detection_is_dropped(self):
-        """A detection whose raw duration is >10x the cap is treated as a corrupt
-        timestamp and dropped, leaving the audio untouched."""
+    def test_implausibly_long_detection_is_censored_but_bounded(self):
+        """A detection whose raw duration is >10x the cap is still censored (the word
+        must not slip through), but bounded to a short window anchored at its start —
+        it must NOT mute the whole span."""
         duration_ms = 12_000
         source = _make_source(duration_ms)
-        source_rms = source.rms
 
-        # 9s raw span vs 750ms cap => 12x the cap => should be dropped entirely.
+        # 9s raw span vs 750ms cap => 12x the cap. Word starts at 1.0s.
         detection = Detection(
             word="crap",
             timestamp_range=TimestampRange(start=1.0, end=10.0),
@@ -178,14 +178,21 @@ class TestMuteDoesNotRunToEndOfFile:
 
             out = AudioSegment.from_file(str(output_path))
 
-            # Nothing should be muted anywhere: whole-file RMS stays close to source.
-            assert out.rms >= source_rms * 0.9, (
-                f"Audio was censored despite the detection being an implausible "
-                f"timestamp that should be dropped (out RMS={out.rms}, "
-                f"source RMS={source_rms})."
+            # The word IS censored: a bounded window anchored at the start (1.0s)
+            # is muted. Only the cap's worth of audio (+ buffer) is silenced.
+            assert result.total_censored_duration > 0.0, (
+                "Implausible-duration detection was dropped; the word slipped through."
             )
-            # total_censored_duration should be ~0 since the window was dropped.
-            assert result.total_censored_duration == 0.0
+            assert result.total_censored_duration <= 1.0, (
+                f"Censored window was not bounded to the cap "
+                f"(total={result.total_censored_duration}s)."
+            )
+            # Just after the start is muted...
+            assert _rms_between(out, 1_100, 1_600) < source.rms * 0.5
+            # ...but the vast majority of the raw span (up to the bogus 10s end) plays.
+            assert _rms_between(out, 3_000, 9_000) > 0, (
+                "Audio in the bogus span was silenced; the mute was not bounded."
+            )
 
     def test_valid_short_detection_still_mutes(self):
         """Sanity: a normal, valid detection is still muted correctly (the fix must
@@ -278,3 +285,51 @@ class TestExportParamsUseProbedSampleRate:
         processor = AudioProcessor()
         params = processor._build_export_params(None, actual_sample_rate=48000)
         assert params == {"format": "wav"}
+
+
+class TestRepairWordTiming:
+    """The transcriber repairs bad word timings so the word is still censored,
+    dropping only when there is no usable start anchor."""
+
+    def test_valid_timing_unchanged(self):
+        from video_profanity_censor.speech_recognizer import _repair_word_timing
+
+        assert _repair_word_timing(12.0, 12.5) == (12.0, 12.5)
+
+    def test_none_end_synthesizes_short_end(self):
+        from video_profanity_censor.speech_recognizer import (
+            _repair_word_timing,
+            _DEFAULT_WORD_DURATION_S,
+        )
+
+        start, end = _repair_word_timing(12.0, None)
+        assert start == 12.0
+        assert end == 12.0 + _DEFAULT_WORD_DURATION_S
+
+    def test_non_positive_duration_synthesizes_end(self):
+        from video_profanity_censor.speech_recognizer import _repair_word_timing
+
+        start, end = _repair_word_timing(2.0, 2.0)
+        assert start == 2.0
+        assert end > start
+
+    def test_nan_end_synthesizes_end(self):
+        from video_profanity_censor.speech_recognizer import _repair_word_timing
+
+        start, end = _repair_word_timing(3.0, float("nan"))
+        assert start == 3.0
+        assert end > start
+
+    def test_valid_but_large_end_is_kept(self):
+        """A large-but-valid end is kept here; the audio processor bounds the final
+        window, so the word is still censored without muting the whole span."""
+        from video_profanity_censor.speech_recognizer import _repair_word_timing
+
+        assert _repair_word_timing(12.0, 9999.0) == (12.0, 9999.0)
+
+    def test_unusable_start_is_dropped(self):
+        from video_profanity_censor.speech_recognizer import _repair_word_timing
+
+        assert _repair_word_timing(None, 12.5) is None
+        assert _repair_word_timing(-1.0, 0.5) is None
+        assert _repair_word_timing(float("inf"), 12.5) is None
