@@ -18,37 +18,62 @@ from video_profanity_censor.models import (
 logger = logging.getLogger(__name__)
 
 
-def _has_valid_timing(start, end) -> bool:
-    """Return True if a word's start/end timestamps are usable.
+# Fallback duration (seconds) used to synthesize a word's end time when Whisper
+# returns a missing/invalid end but a usable start. Kept short so a repaired word
+# still gets censored without muting an unbounded span; the audio processor further
+# bounds the final window by its own max_word_duration_ms cap.
+_DEFAULT_WORD_DURATION_S: float = 0.5
+
+
+def _repair_word_timing(start, end):
+    """Return usable (start, end) timestamps for a word, repairing where possible.
 
     faster-whisper can occasionally emit ``None`` timestamps or a non-positive
-    duration (``end <= start``), especially on the final word of a segment.
-    Such words must not become censor windows: downstream, an ``end`` that is
-    missing or overruns gets clamped to the full track duration, which mutes
-    everything after the word to the end of the file. Rejecting them here keeps
-    those bad values out of the pipeline entirely.
+    duration (``end <= start``), especially on the final word of a segment. A bad
+    ``end`` must not flow downstream unchanged: it gets clamped to the full track
+    duration and mutes everything after the word to the end of the file.
+
+    We prefer to still censor the word rather than drop it. The word's START is the
+    reliable anchor for where the profanity begins, so:
+      - If the start is missing or invalid, there is no usable anchor — return None
+        so the caller skips the word (it cannot be placed).
+      - If the start is valid but the end is missing/invalid or not after the start,
+        synthesize a short end (start + _DEFAULT_WORD_DURATION_S) so the word is
+        still covered by a bounded window.
+      - If both are valid, return them unchanged.
 
     Args:
         start: Word start time in seconds (or None).
         end: Word end time in seconds (or None).
 
     Returns:
-        True if both timestamps are present, finite, non-negative, and end > start.
+        A ``(start, end)`` float tuple, or ``None`` if the start is unusable.
     """
     import math
 
-    if start is None or end is None:
-        return False
+    if start is None:
+        return None
     try:
         start_f = float(start)
-        end_f = float(end)
     except (TypeError, ValueError):
-        return False
-    if not (math.isfinite(start_f) and math.isfinite(end_f)):
-        return False
-    if start_f < 0 or end_f <= start_f:
-        return False
-    return True
+        return None
+    if not math.isfinite(start_f) or start_f < 0:
+        return None
+
+    # Validate the end; synthesize one if it is missing/invalid or not after start.
+    end_f: float | None = None
+    if end is not None:
+        try:
+            candidate = float(end)
+        except (TypeError, ValueError):
+            candidate = None
+        if candidate is not None and math.isfinite(candidate) and candidate > start_f:
+            end_f = candidate
+
+    if end_f is None:
+        end_f = start_f + _DEFAULT_WORD_DURATION_S
+
+    return start_f, end_f
 
 
 class SpeechRecognizer:
@@ -479,22 +504,34 @@ class SpeechRecognizer:
                     if not word_text:
                         continue
 
-                    # Skip words with missing or invalid timestamps. A None or
-                    # non-positive-duration end would otherwise be clamped to the
-                    # full track duration downstream and mute to end-of-file.
-                    if not _has_valid_timing(word_info.start, word_info.end):
+                    # Repair missing/invalid timestamps. A None or non-positive-
+                    # duration end would otherwise be clamped to the full track
+                    # duration downstream and mute to end-of-file. We keep the word
+                    # (so it can still be censored), synthesizing a short end when
+                    # only the end is bad; we skip only when the start is unusable and
+                    # the word cannot be placed at all.
+                    repaired = _repair_word_timing(word_info.start, word_info.end)
+                    if repaired is None:
                         logger.warning(
-                            "Skipping word %r with invalid timing "
+                            "Skipping word %r with unusable start timing "
                             "(start=%r, end=%r)",
                             word_text, word_info.start, word_info.end,
                         )
                         continue
+                    word_start, word_end = repaired
+                    if word_end != word_info.end or word_start != word_info.start:
+                        logger.warning(
+                            "Repaired timing for word %r: (start=%r, end=%r) -> "
+                            "(%.3f, %.3f)",
+                            word_text, word_info.start, word_info.end,
+                            word_start, word_end,
+                        )
 
                     words.append(
                         TranscribedWord(
                             word=word_text,
-                            start=word_info.start,
-                            end=word_info.end,
+                            start=word_start,
+                            end=word_end,
                             confidence=word_info.probability,
                         )
                     )

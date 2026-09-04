@@ -54,9 +54,11 @@ class AudioProcessor:
     """Replaces profane audio segments with censor tone or silence."""
 
     # A detection whose raw (pre-buffer) duration exceeds this many times the
-    # max_word_duration_ms cap is treated as a corrupt timestamp and dropped
-    # rather than censored. Keeps a single bad word from muting large spans.
-    _MAX_DURATION_REJECT_FACTOR: int = 10
+    # max_word_duration_ms cap is treated as a likely corrupt timestamp. Such a
+    # detection is still censored, but bounded to a short window anchored at its
+    # start (see the end cap in censor()); this constant only sets the threshold at
+    # which that suspicious duration is logged.
+    _SUSPICIOUS_DURATION_FACTOR: int = 10
 
     def __init__(
         self, mode: CensorMode = CensorMode.MUTE, tone_freq: int = 1000,
@@ -148,22 +150,25 @@ class AudioProcessor:
             raw_start_s = detection.timestamp_range.start
             raw_end_s = detection.timestamp_range.end
 
-            # Defensive guard: a detection whose raw duration is implausibly long is
-            # almost certainly a bad Whisper timestamp (e.g. the word inherited the
-            # segment/track end time). Censoring it would mute a huge span — the
-            # "muted from the first swear to the end of the episode" bug. Rather than
-            # anchoring such a window to the wrong place, drop it entirely. The guard
-            # only triggers when a cap is configured (max_word_duration_ms > 0).
+            # A detection whose raw duration is implausibly long is almost certainly a
+            # bad Whisper timestamp (e.g. the word inherited the segment/track end
+            # time). We must NOT mute the whole span — that is the "muted from the
+            # first swear to the end of the episode" bug — but we also want the word to
+            # still be censored. The word's START marks where the profanity begins and
+            # is the reliable anchor, so we keep the start and censor a bounded window
+            # from it. The end cap below enforces this; the log here just flags that a
+            # suspicious duration was bounded. Only active when a cap is configured.
             if self.max_word_duration_ms > 0:
                 raw_duration_ms = int((raw_end_s - raw_start_s) * 1000)
-                if raw_duration_ms > self.max_word_duration_ms * self._MAX_DURATION_REJECT_FACTOR:
+                if raw_duration_ms > self.max_word_duration_ms * self._SUSPICIOUS_DURATION_FACTOR:
                     logger.warning(
-                        "Skipping detection %r with implausible duration %dms "
-                        "(> %dx the %dms cap); likely a bad transcription timestamp.",
+                        "Detection %r has implausible duration %dms "
+                        "(> %dx the %dms cap); likely a bad transcription timestamp. "
+                        "Censoring a bounded %dms window from its start instead.",
                         detection.word, raw_duration_ms,
-                        self._MAX_DURATION_REJECT_FACTOR, self.max_word_duration_ms,
+                        self._SUSPICIOUS_DURATION_FACTOR, self.max_word_duration_ms,
+                        self.max_word_duration_ms,
                     )
-                    continue
 
             start_ms = int(raw_start_s * 1000) - self.censor_buffer_ms
             end_ms = int(raw_end_s * 1000) + self.censor_buffer_ms
@@ -173,7 +178,7 @@ class AudioProcessor:
             # where the profanity begins), so we keep the start and cap the END. This
             # bounds every censor window to at most max_word_duration_ms and guarantees
             # a single detection can never mute past start + cap, regardless of a
-            # bogus end value.
+            # bogus end value — while still covering the word.
             if self.max_word_duration_ms > 0:
                 max_end_ms = start_ms + self.max_word_duration_ms
                 if end_ms > max_end_ms:
