@@ -41,6 +41,39 @@ class SpeechRecognizer:
         self._model = None
         self._fell_back_to_cpu = False
 
+    def __enter__(self) -> "SpeechRecognizer":
+        """Enter the context manager, returning this recognizer."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Release the underlying model when leaving the context."""
+        self.release_model()
+
+    def release_model(self) -> None:
+        """Releases the loaded Whisper model and frees its memory.
+
+        The faster-whisper/CTranslate2 model can consume several GB of RAM
+        (the MEDIUM model in particular). It is only needed during
+        transcription — profanity detection operates on the TranscriptionResult,
+        not the model — so releasing it before the audio censoring stage frees
+        that memory and prevents it from stacking with the censoring buffer.
+
+        Idempotent: safe to call multiple times. Does nothing if no model is loaded.
+        """
+        import gc
+
+        if self._model is None:
+            return
+
+        # Drop the reference to the underlying CTranslate2 model, then the dict.
+        self._model.pop("whisper_model", None)
+        self._model = None
+
+        # Force a collection so the (potentially multi-GB) native model is freed.
+        gc.collect()
+
+        logger.info("Whisper model released and memory reclaimed.")
+
     @property
     def model_size(self) -> str:
         """The Whisper model size being used."""

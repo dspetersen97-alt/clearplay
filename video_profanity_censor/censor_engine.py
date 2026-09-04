@@ -405,11 +405,20 @@ class CensorEngine:
         if subtitle_scan_result is not None and subtitle_scan_result.profanity_regions:
             regions = subtitle_scan_result.profanity_regions
 
-        return recognizer.transcribe(
-            audio_path=audio_path,
-            regions=regions,
-            progress_callback=progress_callback,
-        )
+        try:
+            return recognizer.transcribe(
+                audio_path=audio_path,
+                regions=regions,
+                progress_callback=progress_callback,
+            )
+        finally:
+            # The Whisper model (several GB via CTranslate2) is no longer needed
+            # once transcription completes — profanity detection works on the
+            # TranscriptionResult, not the model. Release it here so the memory
+            # is reclaimed BEFORE the audio censoring stage runs, and even if a
+            # later stage fails. This prevents the un-freed model from stacking
+            # with the censoring buffer and driving the process into swap/OOM.
+            recognizer.release_model()
 
     def _stage_detect_profanity(
         self,

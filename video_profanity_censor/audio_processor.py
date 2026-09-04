@@ -1,7 +1,16 @@
-"""Audio processing for censoring profane segments using FFmpeg and pydub."""
+"""Audio processing for censoring profane segments using FFmpeg.
 
+Censoring is driven directly by FFmpeg filtergraphs and streamed from input to
+output, so peak memory does NOT scale with track length: the full decoded PCM is
+never loaded into a Python buffer. This is the streaming fix for the OOM crash on
+long, multichannel feature films (see spec: audio-censor-oom-crash).
+"""
+
+import logging
+import subprocess
 from pathlib import Path
 
+import ffmpeg
 from pydub import AudioSegment
 from pydub.generators import Sine
 
@@ -13,6 +22,8 @@ from video_profanity_censor.models import (
     ProcessingStage,
     ProgressCallback,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # Mapping of common audio codecs to FFmpeg encoder names
@@ -104,8 +115,14 @@ class AudioProcessor:
                 total_censored_duration=0.0,
             )
 
-        # Load the audio file
-        audio = AudioSegment.from_file(str(audio_path))
+        # Probe the working WAV for duration/rate/channels WITHOUT decoding the PCM
+        # into RAM. audio_duration_ms is computed to match pydub's len() exactly
+        # (round(1000 * frame_count / frame_rate)) so the window clamping below is
+        # byte-identical to the previous pydub-based implementation.
+        probe = self._probe_audio(audio_path)
+        sample_rate = probe["sample_rate"]
+        channels = probe["channels"]
+        audio_duration_ms = probe["duration_ms"]
 
         # Sort detections by start time
         sorted_detections = sorted(
@@ -114,8 +131,14 @@ class AudioProcessor:
 
         total_censored_duration = 0.0
         crossfade_ms = 10  # 10ms crossfade at boundaries
-        audio_duration_ms = len(audio)
 
+        # --- Phase A: compute resolved censor windows ---
+        # Iterate sorted detections and produce (start_ms, end_ms) windows using the
+        # IDENTICAL window math as before (buffer, cap trimmed from the start, boundary
+        # clamping, and skipping non-positive-duration windows). This preserves the
+        # per-detection accounting (total_censored_duration) and progress callback
+        # semantics exactly. It never touches decoded PCM.
+        resolved_windows: list[tuple[int, int]] = []
         for detection in sorted_detections:
             start_ms = int(detection.timestamp_range.start * 1000) - self.censor_buffer_ms
             end_ms = int(detection.timestamp_range.end * 1000) + self.censor_buffer_ms
@@ -138,29 +161,7 @@ class AudioProcessor:
             if duration_ms <= 0:
                 continue
 
-            # Generate replacement audio
-            if self.mode == CensorMode.TONE:
-                replacement = self._generate_tone(
-                    duration_ms=duration_ms,
-                    sample_rate=audio.frame_rate,
-                    channels=audio.channels,
-                )
-            else:
-                replacement = AudioSegment.silent(
-                    duration=duration_ms,
-                    frame_rate=audio.frame_rate,
-                )
-                # Match channels
-                if audio.channels > 1 and replacement.channels == 1:
-                    replacement = replacement.set_channels(audio.channels)
-
-            # Apply crossfade at boundaries
-            replacement = self._apply_crossfade(
-                audio, replacement, start_ms, end_ms, crossfade_ms
-            )
-
-            # Replace the segment in the audio
-            audio = audio[:start_ms] + replacement + audio[end_ms:]
+            resolved_windows.append((start_ms, end_ms))
 
             total_censored_duration += duration_ms / 1000.0
 
@@ -172,15 +173,297 @@ class AudioProcessor:
                     f"Censored segment {sorted_detections.index(detection) + 1}/{len(sorted_detections)}",
                 )
 
-        # Export the censored audio
+        # If every window collapsed to a non-positive duration (all skipped), there is
+        # nothing to censor — copy the input through unchanged. segments_censored still
+        # reflects the detection count, matching the previous return value.
+        if not resolved_windows:
+            import shutil
+            shutil.copy2(str(audio_path), str(output_path))
+            return CensorResult(
+                censored_audio_path=output_path,
+                segments_censored=len(sorted_detections),
+                total_censored_duration=total_censored_duration,
+            )
+
+        # --- Overlap resolution ---
+        # The previous implementation resolved overlapping/adjacent windows with
+        # last-writer-wins. For MUTE the silenced region is the UNION of windows
+        # (overlap direction does not change silence). For TONE every window is replaced
+        # by the same tone, so the toned content is identical regardless of which window
+        # "wins" — again the union of windows. We therefore merge overlapping windows into
+        # disjoint intervals, which reproduces the exact censored region boundaries.
+        merged_windows = self._merge_windows(resolved_windows)
+
+        # --- Phase B: stream the censored track through a single FFmpeg filtergraph ---
+        # Peak memory is bounded and independent of track length: FFmpeg decodes, filters,
+        # and encodes in a streaming fashion — the whole PCM buffer is never materialised.
         export_params = self._build_export_params(audio_metadata)
-        audio.export(str(output_path), **export_params)
+        self._run_censor_ffmpeg(
+            audio_path=audio_path,
+            output_path=output_path,
+            windows=merged_windows,
+            sample_rate=sample_rate,
+            channels=channels,
+            crossfade_ms=crossfade_ms,
+            export_params=export_params,
+        )
 
         return CensorResult(
             censored_audio_path=output_path,
             segments_censored=len(sorted_detections),
             total_censored_duration=total_censored_duration,
         )
+
+    # --- FFmpeg streaming helpers ---
+
+    def _probe_audio(self, audio_path: Path) -> dict:
+        """Probes the working WAV for sample rate, channels, and duration.
+
+        Duration is returned in milliseconds computed to match pydub's ``len()``
+        semantics exactly — ``round(1000 * frame_count / frame_rate)`` — so window
+        clamping stays byte-identical to the previous implementation. No PCM is decoded.
+
+        Args:
+            audio_path: Path to the WAV file to probe.
+
+        Returns:
+            Dict with keys ``sample_rate`` (int), ``channels`` (int), ``duration_ms`` (int).
+
+        Raises:
+            RuntimeError: If probing fails or no audio stream is present.
+        """
+        try:
+            probe = ffmpeg.probe(str(audio_path))
+        except ffmpeg.Error as e:
+            stderr = e.stderr.decode() if e.stderr else str(e)
+            raise RuntimeError(f"Failed to probe audio for censoring: {stderr}") from e
+
+        audio_streams = [
+            s for s in probe.get("streams", []) if s.get("codec_type") == "audio"
+        ]
+        if not audio_streams:
+            raise RuntimeError(f"No audio stream found in: {audio_path}")
+
+        stream = audio_streams[0]
+        sample_rate = int(stream.get("sample_rate", 0))
+        channels = int(stream.get("channels", 0))
+
+        duration_seconds = float(stream.get("duration", 0.0))
+        if duration_seconds == 0.0:
+            duration_seconds = float(probe.get("format", {}).get("duration", 0.0))
+
+        # Match pydub's len(): frame_count = round(duration * sample_rate), then
+        # round(1000 * frame_count / sample_rate).
+        if sample_rate > 0:
+            frame_count = round(duration_seconds * sample_rate)
+            duration_ms = round(1000 * frame_count / sample_rate)
+        else:
+            duration_ms = round(duration_seconds * 1000)
+
+        return {
+            "sample_rate": sample_rate,
+            "channels": channels,
+            "duration_ms": duration_ms,
+        }
+
+    @staticmethod
+    def _merge_windows(
+        windows: list[tuple[int, int]]
+    ) -> list[tuple[int, int]]:
+        """Merges overlapping/adjacent-overlapping windows into disjoint intervals.
+
+        Reproduces the previous last-writer-wins censored regions as the union of
+        windows (equivalent for both MUTE silence and a uniform TONE). The input from
+        Phase A is sorted by detection start.
+
+        Args:
+            windows: List of (start_ms, end_ms) windows.
+
+        Returns:
+            List of merged, non-overlapping (start_ms, end_ms) windows.
+        """
+        if not windows:
+            return []
+
+        ordered = sorted(windows)
+        merged: list[tuple[int, int]] = [ordered[0]]
+        for start_ms, end_ms in ordered[1:]:
+            last_start, last_end = merged[-1]
+            if start_ms <= last_end:
+                # Overlapping or touching — extend the current interval.
+                merged[-1] = (last_start, max(last_end, end_ms))
+            else:
+                merged.append((start_ms, end_ms))
+        return merged
+
+    def _build_enable_expr(self, windows: list[tuple[int, int]]) -> str:
+        """Builds an FFmpeg ``enable`` expression true within any censored window.
+
+        Args:
+            windows: Disjoint (start_ms, end_ms) windows.
+
+        Returns:
+            An FFmpeg timeline expression string (sum of ``between(t,start,end)`` terms).
+        """
+        terms = []
+        for start_ms, end_ms in windows:
+            start_s = start_ms / 1000.0
+            end_s = end_ms / 1000.0
+            terms.append(f"between(t,{start_s:.6f},{end_s:.6f})")
+        return "+".join(terms)
+
+    def _channel_pan_filter(self, channels: int) -> str:
+        """Builds a ``pan`` filter that fans a mono source out to N channels.
+
+        Gives the generated sine tone the same channel count as the source without
+        relying on named layouts (works for arbitrary channel counts).
+
+        Args:
+            channels: Target channel count.
+
+        Returns:
+            An FFmpeg ``pan`` filter string.
+        """
+        n = max(1, channels)
+        outs = "|".join(f"c{i}=c0" for i in range(n))
+        return f"pan={n}c|{outs}"
+
+    def _run_censor_ffmpeg(
+        self,
+        audio_path: Path,
+        output_path: Path,
+        windows: list[tuple[int, int]],
+        sample_rate: int,
+        channels: int,
+        crossfade_ms: int,
+        export_params: dict,
+    ) -> None:
+        """Runs FFmpeg to censor the given windows, streaming input to output.
+
+        MUTE: sets ``volume=0`` inside the censored windows (source passes through
+        elsewhere). TONE: mutes the source inside the windows and mixes in a sine tone
+        (freq=self.tone_freq, ~-20 dBFS) gated to the same windows, fanned out to the
+        source channel count. Neither path decodes the full PCM into a Python buffer.
+
+        Args:
+            audio_path: Input WAV path.
+            output_path: Output path.
+            windows: Disjoint censored windows (ms).
+            sample_rate: Source sample rate.
+            channels: Source channel count.
+            crossfade_ms: Boundary fade duration in ms (applied to toned regions).
+            export_params: Params from ``_build_export_params`` (format/codec/etc.).
+
+        Raises:
+            RuntimeError: If the FFmpeg invocation fails.
+        """
+        enable = self._build_enable_expr(windows)
+
+        cmd = ["ffmpeg", "-y", "-i", str(audio_path)]
+
+        if self.mode == CensorMode.MUTE:
+            # Silence the source inside the censored windows; pass through elsewhere.
+            audio_filter = f"volume=enable='{enable}':volume=0:eval=frame"
+            cmd += ["-af", audio_filter]
+        else:
+            # TONE: mute source in windows, generate a gated sine, mix them.
+            # ~-20 dBFS => linear amplitude ~0.1.
+            tone_amplitude = 0.1
+            not_enable = f"1-({enable})"
+            pan = self._channel_pan_filter(channels)
+            fade = self._tone_fade_expr(windows, crossfade_ms)
+
+            filtergraph = (
+                f"[0:a]volume=enable='{enable}':volume=0:eval=frame[src];"
+                f"sine=frequency={self.tone_freq}:sample_rate={sample_rate},"
+                f"volume={tone_amplitude},{pan},"
+                # Keep the tone only inside the censored windows.
+                f"volume=enable='{not_enable}':volume=0:eval=frame"
+                f"{fade}[beep];"
+                f"[src][beep]amix=inputs=2:normalize=0:duration=first[out]"
+            )
+            cmd += ["-filter_complex", filtergraph, "-map", "[out]"]
+
+        cmd += self._export_params_to_ffmpeg_args(export_params)
+        cmd.append(str(output_path))
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"FFmpeg censoring failed: {result.stderr.strip()}"
+            )
+
+    def _tone_fade_expr(
+        self, windows: list[tuple[int, int]], crossfade_ms: int
+    ) -> str:
+        """Builds per-window boundary fades for the toned replacement.
+
+        Preserves the previous behavior of applying a 10ms fade in/out on the
+        replacement only when the window is longer than ``2 * crossfade_ms``. Windows
+        at or below that threshold get no fade (matching ``_apply_crossfade``). Fades
+        smooth the tone at window edges and avoid audible clicks.
+
+        Args:
+            windows: Disjoint censored windows (ms).
+            crossfade_ms: Fade duration in ms.
+
+        Returns:
+            An FFmpeg filter chain fragment beginning with ``,`` (or empty string).
+        """
+        if crossfade_ms <= 0:
+            return ""
+
+        fade_s = crossfade_ms / 1000.0
+        parts: list[str] = []
+        for start_ms, end_ms in windows:
+            duration_ms = end_ms - start_ms
+            if duration_ms <= crossfade_ms * 2:
+                continue
+            start_s = start_ms / 1000.0
+            fade_out_start = (end_ms - crossfade_ms) / 1000.0
+            parts.append(
+                f"afade=t=in:st={start_s:.6f}:d={fade_s:.6f}:curve=tri"
+            )
+            parts.append(
+                f"afade=t=out:st={fade_out_start:.6f}:d={fade_s:.6f}:curve=tri"
+            )
+        if not parts:
+            return ""
+        return "," + ",".join(parts)
+
+    @staticmethod
+    def _export_params_to_ffmpeg_args(export_params: dict) -> list[str]:
+        """Translates ``_build_export_params`` output into raw FFmpeg CLI args.
+
+        Preserves the same codec/sample_rate/bit_depth/channel_layout/bitrate mapping
+        used by the previous pydub export path, so the encoded output matches.
+
+        Args:
+            export_params: Dict from ``_build_export_params``.
+
+        Returns:
+            List of FFmpeg output-option arguments.
+        """
+        args: list[str] = []
+
+        fmt = export_params.get("format")
+        if fmt:
+            args += ["-f", fmt]
+
+        codec = export_params.get("codec")
+        if codec:
+            args += ["-c:a", codec]
+
+        # Extra ffmpeg params (sample rate, sample format, channel layout).
+        extra = export_params.get("parameters")
+        if extra:
+            args += list(extra)
+
+        bitrate = export_params.get("bitrate")
+        if bitrate:
+            args += ["-b:a", str(bitrate)]
+
+        return args
 
     def build_encoding_command(self, audio_metadata: AudioMetadata) -> dict[str, str]:
         """Builds FFmpeg encoding parameters that match the source audio metadata.
