@@ -19,6 +19,7 @@ from video_profanity_censor.backend_selector import BackendSelector
 from video_profanity_censor.input_validator import InputValidator
 from video_profanity_censor.models import (
     AccelerationBackend,
+    AudioMetadata,
     CensorMode,
     DetectionResult,
     ProcessingResult,
@@ -272,6 +273,7 @@ class CensorEngine:
                     detection_result,
                     censor_mode,
                     progress_callback,
+                    audio_metadata=extraction_result.audio_metadata,
                 )
                 temp_files.append(censor_result.censored_audio_path)
             except Exception as e:
@@ -445,8 +447,16 @@ class CensorEngine:
         detection_result: DetectionResult,
         censor_mode: CensorMode,
         progress_callback: ProgressCallback,
+        audio_metadata: AudioMetadata | None = None,
     ):
-        """Run audio censoring stage."""
+        """Run audio censoring stage.
+
+        Passing ``audio_metadata`` lets the processor re-encode the censored track
+        back to the SOURCE codec/sample rate/layout. Without it the censored audio
+        is written as raw PCM/WAV, which the assembler then stream-copies verbatim —
+        leaving the output file's audio track as raw PCM (reported as ``araw``)
+        instead of the original codec.
+        """
         from video_profanity_censor.audio_processor import AudioProcessor
 
         processor = AudioProcessor(mode=censor_mode)
@@ -460,6 +470,7 @@ class CensorEngine:
             audio_path=audio_path,
             detections=detection_result.detections,
             output_path=censored_path,
+            audio_metadata=audio_metadata,
             progress_callback=progress_callback,
         )
 

@@ -53,6 +53,11 @@ BIT_DEPTH_TO_SAMPLE_FMT: dict[int, str] = {
 class AudioProcessor:
     """Replaces profane audio segments with censor tone or silence."""
 
+    # A detection whose raw (pre-buffer) duration exceeds this many times the
+    # max_word_duration_ms cap is treated as a corrupt timestamp and dropped
+    # rather than censored. Keeps a single bad word from muting large spans.
+    _MAX_DURATION_REJECT_FACTOR: int = 10
+
     def __init__(
         self, mode: CensorMode = CensorMode.MUTE, tone_freq: int = 1000,
         censor_buffer_ms: int = 100, max_word_duration_ms: int = 750,
@@ -140,17 +145,39 @@ class AudioProcessor:
         # semantics exactly. It never touches decoded PCM.
         resolved_windows: list[tuple[int, int]] = []
         for detection in sorted_detections:
-            start_ms = int(detection.timestamp_range.start * 1000) - self.censor_buffer_ms
-            end_ms = int(detection.timestamp_range.end * 1000) + self.censor_buffer_ms
+            raw_start_s = detection.timestamp_range.start
+            raw_end_s = detection.timestamp_range.end
 
-            # Cap word duration to avoid overly long mutes from imprecise Whisper timestamps.
-            # When Whisper assigns too-long durations, the actual word is typically at the END
-            # of the range (Whisper anchors the start too early), so we trim from the start.
+            # Defensive guard: a detection whose raw duration is implausibly long is
+            # almost certainly a bad Whisper timestamp (e.g. the word inherited the
+            # segment/track end time). Censoring it would mute a huge span — the
+            # "muted from the first swear to the end of the episode" bug. Rather than
+            # anchoring such a window to the wrong place, drop it entirely. The guard
+            # only triggers when a cap is configured (max_word_duration_ms > 0).
             if self.max_word_duration_ms > 0:
-                raw_duration = end_ms - start_ms
-                if raw_duration > self.max_word_duration_ms:
-                    # Keep the end, trim the start — the word is spoken near the end
-                    start_ms = end_ms - self.max_word_duration_ms
+                raw_duration_ms = int((raw_end_s - raw_start_s) * 1000)
+                if raw_duration_ms > self.max_word_duration_ms * self._MAX_DURATION_REJECT_FACTOR:
+                    logger.warning(
+                        "Skipping detection %r with implausible duration %dms "
+                        "(> %dx the %dms cap); likely a bad transcription timestamp.",
+                        detection.word, raw_duration_ms,
+                        self._MAX_DURATION_REJECT_FACTOR, self.max_word_duration_ms,
+                    )
+                    continue
+
+            start_ms = int(raw_start_s * 1000) - self.censor_buffer_ms
+            end_ms = int(raw_end_s * 1000) + self.censor_buffer_ms
+
+            # Cap word duration to avoid overly long mutes from imprecise Whisper
+            # timestamps. The detected word's START is the reliable anchor (it marks
+            # where the profanity begins), so we keep the start and cap the END. This
+            # bounds every censor window to at most max_word_duration_ms and guarantees
+            # a single detection can never mute past start + cap, regardless of a
+            # bogus end value.
+            if self.max_word_duration_ms > 0:
+                max_end_ms = start_ms + self.max_word_duration_ms
+                if end_ms > max_end_ms:
+                    end_ms = max_end_ms
 
             # Clamp to audio boundaries
             start_ms = max(0, start_ms)
@@ -197,7 +224,13 @@ class AudioProcessor:
         # --- Phase B: stream the censored track through a single FFmpeg filtergraph ---
         # Peak memory is bounded and independent of track length: FFmpeg decodes, filters,
         # and encodes in a streaming fashion — the whole PCM buffer is never materialised.
-        export_params = self._build_export_params(audio_metadata)
+        # Use the sample rate PROBED from the actual working WAV for the export,
+        # not the sample rate carried in audio_metadata. The metadata rate can drift
+        # from the file being encoded; encoding at a rate that differs from the real
+        # PCM rate shifts pitch/speed. The probed rate is authoritative.
+        export_params = self._build_export_params(
+            audio_metadata, actual_sample_rate=sample_rate
+        )
         self._run_censor_ffmpeg(
             audio_path=audio_path,
             output_path=output_path,
@@ -501,18 +534,33 @@ class AudioProcessor:
         return params
 
     def _build_export_params(
-        self, audio_metadata: AudioMetadata | None
+        self,
+        audio_metadata: AudioMetadata | None,
+        actual_sample_rate: int | None = None,
     ) -> dict:
         """Builds pydub export parameters from audio metadata.
 
         Args:
             audio_metadata: Source audio metadata. If None, exports as WAV.
+            actual_sample_rate: The sample rate PROBED from the working WAV that is
+                actually being encoded. When provided and valid (> 0), it takes
+                precedence over ``audio_metadata.sample_rate`` for the ``-ar`` option.
+                Encoding at a rate that differs from the real PCM rate shifts
+                pitch/speed, so the probed rate must win when the two disagree.
 
         Returns:
             Dictionary of export parameters for pydub's export method.
         """
         if audio_metadata is None:
             return {"format": "wav"}
+
+        # The rate of the PCM actually being encoded is authoritative. Fall back to
+        # the source metadata rate only when no probed rate was supplied.
+        export_sample_rate = (
+            actual_sample_rate
+            if actual_sample_rate and actual_sample_rate > 0
+            else audio_metadata.sample_rate
+        )
 
         # Determine format from codec
         format_map = {
@@ -542,9 +590,9 @@ class AudioProcessor:
         # Build ffmpeg parameters list
         ffmpeg_params = []
 
-        # Sample rate
-        if audio_metadata.sample_rate > 0:
-            ffmpeg_params.extend(["-ar", str(audio_metadata.sample_rate)])
+        # Sample rate — use the probed rate of the WAV being encoded (see above).
+        if export_sample_rate > 0:
+            ffmpeg_params.extend(["-ar", str(export_sample_rate)])
 
         # Bit depth (sample format)
         if audio_metadata.bit_depth in BIT_DEPTH_TO_SAMPLE_FMT:
