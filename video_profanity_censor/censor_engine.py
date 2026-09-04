@@ -54,6 +54,7 @@ class CensorEngine:
         disable_subtitle_prefilter: bool = False,
         backend: AccelerationBackend | None = None,
         model_size: str | None = None,
+        progress_callback: ProgressCallback = None,
     ) -> ProcessingResult:
         """Orchestrates the full censoring pipeline.
 
@@ -73,6 +74,10 @@ class CensorEngine:
             disable_subtitle_prefilter: If True, bypasses subtitle scanning (Req 8.9).
             backend: Specific backend to use. None triggers auto-detection (Req 9.4).
             model_size: Whisper model size override. None uses VRAM-based selection (Req 9.6, 9.7).
+            progress_callback: Optional callback receiving (stage, percent, message)
+                updates. When None, progress is reported to stdout via ProgressReporter.
+                Callers such as a GUI can supply their own callback to receive live
+                updates instead.
 
         Returns:
             ProcessingResult with success status, paths, and processing summary.
@@ -93,11 +98,12 @@ class CensorEngine:
         else:
             report_path = Path(report_path)
 
-        # Create progress reporter
-        from video_profanity_censor.progress_reporter import ProgressReporter
+        # Create progress reporter, unless the caller supplied its own callback.
+        if progress_callback is None:
+            from video_profanity_censor.progress_reporter import ProgressReporter
 
-        progress_reporter = ProgressReporter()
-        progress_callback: ProgressCallback = progress_reporter.update
+            progress_reporter = ProgressReporter()
+            progress_callback = progress_reporter.update
 
         # Track the active backend and model size for the result
         active_backend: AccelerationBackend | None = None

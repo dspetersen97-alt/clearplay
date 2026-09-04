@@ -1,0 +1,5 @@
+[console_scripts]
+video-profanity-censor = video_profanity_censor.cli:main
+
+[gui_scripts]
+video-profanity-censor-gui = video_profanity_censor.gui:main

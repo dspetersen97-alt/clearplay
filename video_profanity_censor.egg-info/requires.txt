@@ -1,0 +1,11 @@
+openai-whisper>=20231117
+onnxruntime-directml>=1.16.0
+faster-whisper>=1.0.0
+ffmpeg-python>=0.2.0
+pydub>=0.25.1
+nltk>=3.8.1
+
+[dev]
+hypothesis>=6.92.0
+pytest>=7.4.0
+pytest-cov>=4.1.0
