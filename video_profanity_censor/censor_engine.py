@@ -21,11 +21,13 @@ from video_profanity_censor.models import (
     AccelerationBackend,
     AudioMetadata,
     CensorMode,
+    Detection,
     DetectionResult,
     ProcessingResult,
     ProcessingStage,
     ProgressCallback,
     SubtitleScanResult,
+    TimestampRange,
     TranscriptionResult,
 )
 from video_profanity_censor.profanity_detector import ProfanityDetector
@@ -53,6 +55,7 @@ class CensorEngine:
         report_path: Path | None = None,
         subtitle_path: Path | None = None,
         disable_subtitle_prefilter: bool = False,
+        subtitle_fallback: bool = True,
         backend: AccelerationBackend | None = None,
         model_size: str | None = None,
         progress_callback: ProgressCallback = None,
@@ -73,6 +76,10 @@ class CensorEngine:
             report_path: Path for the detection report. None uses default derivation.
             subtitle_path: Path to external subtitle file for pre-filtering.
             disable_subtitle_prefilter: If True, bypasses subtitle scanning (Req 8.9).
+            subtitle_fallback: If True (default), profane words present in the
+                subtitles but missed by the audio transcription are still censored
+                using the subtitle cue timing. Has no effect when subtitles are not
+                available or when subtitle pre-filtering is disabled.
             backend: Specific backend to use. None triggers auto-detection (Req 9.4).
             model_size: Whisper model size override. None uses VRAM-based selection (Req 9.6, 9.7).
             progress_callback: Optional callback receiving (stage, percent, message)
@@ -249,6 +256,25 @@ class CensorEngine:
                     model_size_used=model_size_used,
                 )
             progress_callback(ProcessingStage.PROFANITY_DETECTION, 100.0, "Profanity detection complete")
+
+            # Subtitle fallback: censor profane words that are in the subtitles but
+            # were missed by the audio transcription (e.g. muttered under the breath).
+            # Runs before the "no detections" check so a cue that Whisper missed
+            # entirely still produces an output file.
+            if subtitle_fallback:
+                try:
+                    fallback_detections = self._subtitle_fallback_detections(
+                        subtitle_scan_result,
+                        detection_result.detections,
+                        profanity_list,
+                        censor_mode,
+                    )
+                    if fallback_detections:
+                        detection_result.detections.extend(fallback_detections)
+                except Exception as e:
+                    # The fallback is a safety net, not critical path — never fail the
+                    # whole run because of it; just log and continue with what we have.
+                    logger.warning(f"Subtitle fallback detection failed: {e}")
 
             # If no profanity detected, skip output file creation
             if not detection_result.detections:
@@ -491,6 +517,101 @@ class CensorEngine:
             output_path=output_path,
             audio_track_index=audio_track_index,
         )
+
+    def _subtitle_fallback_detections(
+        self,
+        subtitle_scan_result: SubtitleScanResult | None,
+        existing_detections: list[Detection],
+        profanity_list,
+        censor_mode: CensorMode,
+    ) -> list[Detection]:
+        """Synthesize detections for profane subtitle cues the audio transcription missed.
+
+        The audio transcription can miss profanity that is muttered, low, or
+        overlapped by music — but if the word is present in the subtitles, we still
+        want to censor it. For every profane subtitle cue that is NOT already covered
+        by an existing (transcription-derived) detection, this builds a Detection from
+        the cue's own start/end time so the word gets censored anyway.
+
+        Notes / tradeoffs:
+        - Timing is at CUE granularity. Subtitles do not carry per-word timestamps, so
+          a fallback detection covers the whole cue's span, which may mute a little
+          surrounding non-profane speech in that line. That is the intended tradeoff:
+          over-censoring slightly is preferable to letting an audible word through.
+        - Uses the cue's TRUE (unbuffered) start/end, not the ±2s expanded region, to
+          keep the muted span as tight as possible.
+        - Matching reuses ProfanityDetector against the SAME profanity list, so the
+          scanner, detector, and fallback all agree on what counts as profane.
+
+        Args:
+            subtitle_scan_result: The subtitle scan result, or None when subtitles
+                were not scanned. When None or without profane regions, returns [].
+            existing_detections: Detections already produced from the audio transcription.
+            profanity_list: The shared ProfanityList used across the pipeline.
+            censor_mode: The censor action to record on synthesized detections.
+
+        Returns:
+            A list of newly synthesized Detection objects (may be empty).
+        """
+        if subtitle_scan_result is None or not subtitle_scan_result.profanity_regions:
+            return []
+
+        # A detector purely to reuse the identical whole-word/stem matching logic.
+        detector = ProfanityDetector(
+            profanity_list=profanity_list,
+            censor_mode=censor_mode,
+        )
+
+        # Collect the unique profane cues across all regions (a cue can only appear
+        # once, but regions may share none; dedupe defensively on (start, end, text)).
+        seen_cues: set[tuple[float, float, str]] = set()
+        fallback: list[Detection] = []
+
+        for region in subtitle_scan_result.profanity_regions:
+            for cue in region.source_cues:
+                cue_key = (cue.start, cue.end, cue.text)
+                if cue_key in seen_cues:
+                    continue
+                seen_cues.add(cue_key)
+
+                # Only consider cues that actually contain a profane word.
+                profane_words = [
+                    w for w in cue.text.split() if detector._is_profane(w)
+                ]
+                if not profane_words:
+                    continue
+
+                # Skip if the audio transcription already caught something overlapping
+                # this cue's time window — avoid double-censoring / duplicate report rows.
+                if self._detection_overlaps(existing_detections, cue.start, cue.end):
+                    continue
+
+                fallback.append(
+                    Detection(
+                        word=profane_words[0],
+                        timestamp_range=TimestampRange(start=cue.start, end=cue.end),
+                        censor_action=censor_mode,
+                    )
+                )
+
+        if fallback:
+            logger.info(
+                "Subtitle fallback: censoring %d profane subtitle cue(s) that audio "
+                "transcription did not detect.",
+                len(fallback),
+            )
+
+        return fallback
+
+    @staticmethod
+    def _detection_overlaps(
+        detections: list[Detection], start: float, end: float
+    ) -> bool:
+        """Return True if any detection's time range overlaps [start, end]."""
+        for d in detections:
+            if d.timestamp_range.start < end and d.timestamp_range.end > start:
+                return True
+        return False
 
     # --- Helper methods ---
 

@@ -519,11 +519,17 @@ class SpeechRecognizer:
                         )
                         continue
                     word_start, word_end = repaired
+                    # Zero-duration/short words (e.g. "a", "the") are common and get a
+                    # synthesized end routinely — that is expected, not a problem, so
+                    # log it at DEBUG to avoid flooding normal runs. Cast the originals
+                    # to float so the message reads cleanly (Whisper returns np.float64).
                     if word_end != word_info.end or word_start != word_info.start:
-                        logger.warning(
-                            "Repaired timing for word %r: (start=%r, end=%r) -> "
+                        orig_start = None if word_info.start is None else float(word_info.start)
+                        orig_end = None if word_info.end is None else float(word_info.end)
+                        logger.debug(
+                            "Repaired timing for word %r: (start=%s, end=%s) -> "
                             "(%.3f, %.3f)",
-                            word_text, word_info.start, word_info.end,
+                            word_text, orig_start, orig_end,
                             word_start, word_end,
                         )
 

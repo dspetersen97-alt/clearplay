@@ -91,6 +91,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--disable-subtitle-fallback",
+        action="store_true",
+        default=False,
+        help=(
+            "Disable the subtitle fallback. By default, profane words found in the "
+            "subtitles but missed by audio transcription are still censored using the "
+            "subtitle timing."
+        ),
+    )
+
+    parser.add_argument(
         "--model-size",
         type=str,
         choices=["tiny", "base", "small", "medium", "large"],
@@ -162,6 +173,7 @@ def main(argv: list[str] | None = None) -> int:
         report_path=report_path,
         subtitle_path=subtitle_path,
         disable_subtitle_prefilter=args.disable_subtitle_prefilter,
+        subtitle_fallback=not args.disable_subtitle_fallback,
         model_size=args.model_size,
     )
 
