@@ -9,7 +9,11 @@ import sys
 from pathlib import Path
 
 from video_profanity_censor.censor_engine import CensorEngine
+from video_profanity_censor.input_validator import InputValidator
 from video_profanity_censor.models import CensorMode
+
+# Name of the subfolder that batch (folder) mode writes censored output into.
+FILTERED_DIR_NAME = "filtered"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -29,15 +33,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Examples:\n"
             "  %(prog)s movie.mp4\n"
             "  %(prog)s movie.mp4 --output censored.mp4 --mode mute\n"
-            "  %(prog)s movie.mp4 --backend directml --model-size large\n"
+            "  %(prog)s movie.mp4 --model-size large\n"
             "  %(prog)s movie.mp4 --subtitle-path subs.srt --profanity-list custom.txt\n"
+            "  %(prog)s /home/daniel/Movies   # batch: process every video into Movies/filtered/\n"
         ),
     )
 
     parser.add_argument(
         "input",
         type=str,
-        help="Path to the input video file (required)",
+        help=(
+            "Path to the input video file, OR a folder. When a folder is given, every "
+            "supported video in it is processed into a 'filtered' subfolder."
+        ),
     )
 
     parser.add_argument(
@@ -126,59 +134,31 @@ def _resolve_censor_mode(mode_str: str) -> CensorMode:
     return CensorMode.TONE
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Main CLI entry point.
+def discover_videos(folder: Path) -> list[Path]:
+    """Find supported video files directly inside a folder (non-recursive).
 
-    Parses arguments, runs the censoring pipeline via CensorEngine,
-    and displays progress and summary to stdout.
+    The set of supported extensions is sourced from InputValidator so batch mode
+    and single-file validation always agree. The output 'filtered' subfolder is
+    skipped so re-running a batch never tries to re-censor its own output.
 
     Args:
-        argv: Optional list of arguments. Defaults to sys.argv[1:].
+        folder: Directory to scan.
 
     Returns:
-        Exit code: 0 for success, 1 for failure.
+        A sorted list of video file paths (may be empty).
     """
-    args = parse_args(argv)
+    supported = {ext.lower() for ext in InputValidator.SUPPORTED_FORMATS}
+    videos: list[Path] = []
+    for entry in folder.iterdir():
+        if not entry.is_file():
+            continue
+        if entry.suffix.lower() in supported:
+            videos.append(entry)
+    return sorted(videos)
 
-    # Resolve paths
-    input_path = Path(args.input)
-    output_path = Path(args.output) if args.output else None
-    profanity_list_path = Path(args.profanity_list) if args.profanity_list else None
-    report_path = Path(args.report_path) if args.report_path else None
-    subtitle_path = Path(args.subtitle_path) if args.subtitle_path else None
 
-    # Resolve enums
-    censor_mode = _resolve_censor_mode(args.mode)
-
-    # Display startup info
-    print(f"Video Profanity Censor")
-    print(f"Input: {input_path}")
-    if output_path:
-        print(f"Output: {output_path}")
-    if args.model_size:
-        print(f"Model size: {args.model_size}")
-    else:
-        print("Model size: auto-select")
-    print(f"Censor mode: {args.mode}")
-    print()
-
-    # Run the pipeline
-    engine = CensorEngine()
-    result = engine.process(
-        input_path=input_path,
-        output_path=output_path,
-        audio_track=args.audio_track,
-        censor_mode=censor_mode,
-        profanity_list_path=profanity_list_path,
-        report_path=report_path,
-        subtitle_path=subtitle_path,
-        disable_subtitle_prefilter=args.disable_subtitle_prefilter,
-        subtitle_fallback=not args.disable_subtitle_fallback,
-        model_size=args.model_size,
-    )
-
-    # Display summary
-    print()
+def _print_result(result) -> None:
+    """Print a per-file processing summary block."""
     if result.success:
         print("--- Processing Summary ---")
         print(f"Elapsed time: {_format_duration(result.total_elapsed_seconds)}")
@@ -195,7 +175,6 @@ def main(argv: list[str] | None = None) -> int:
         if result.report_path:
             print(f"Report: {result.report_path}")
         print("--------------------------")
-        return 0
     else:
         print("--- Processing Failed ---")
         if result.error_stage:
@@ -205,7 +184,180 @@ def main(argv: list[str] | None = None) -> int:
         if result.active_backend:
             print(f"Active backend: {result.active_backend.value}")
         print("-------------------------")
+
+
+def _process_one_file(
+    engine: CensorEngine,
+    input_path: Path,
+    output_path: Path | None,
+    report_path: Path | None,
+    subtitle_path: Path | None,
+    args: argparse.Namespace,
+    censor_mode: CensorMode,
+):
+    """Run the censoring pipeline for a single input file and return the result."""
+    profanity_list_path = Path(args.profanity_list) if args.profanity_list else None
+    return engine.process(
+        input_path=input_path,
+        output_path=output_path,
+        audio_track=args.audio_track,
+        censor_mode=censor_mode,
+        profanity_list_path=profanity_list_path,
+        report_path=report_path,
+        subtitle_path=subtitle_path,
+        disable_subtitle_prefilter=args.disable_subtitle_prefilter,
+        subtitle_fallback=not args.disable_subtitle_fallback,
+        model_size=args.model_size,
+    )
+
+
+def _run_single(args: argparse.Namespace, input_path: Path, censor_mode: CensorMode) -> int:
+    """Handle a single-file input. Returns a process exit code."""
+    output_path = Path(args.output) if args.output else None
+    report_path = Path(args.report_path) if args.report_path else None
+    subtitle_path = Path(args.subtitle_path) if args.subtitle_path else None
+
+    print("Video Profanity Censor")
+    print(f"Input: {input_path}")
+    if output_path:
+        print(f"Output: {output_path}")
+    print(f"Model size: {args.model_size or 'auto-select'}")
+    print(f"Censor mode: {args.mode}")
+    print()
+
+    engine = CensorEngine()
+    result = _process_one_file(
+        engine, input_path, output_path, report_path, subtitle_path, args, censor_mode
+    )
+
+    print()
+    _print_result(result)
+    return 0 if result.success else 1
+
+
+def _run_batch(args: argparse.Namespace, folder: Path, censor_mode: CensorMode) -> int:
+    """Handle a folder input: process every supported video into <folder>/filtered/.
+
+    Continues past per-file failures so one bad file (e.g. an undecodable codec)
+    does not abort the whole batch. Returns a process exit code: 0 when at least
+    one file succeeded and none failed, 1 if any file failed or none were found.
+
+    Args:
+        args: Parsed CLI arguments.
+        folder: The input directory.
+        censor_mode: Resolved censor mode.
+
+    Returns:
+        Exit code (0 success, 1 failure/no files).
+    """
+    videos = discover_videos(folder)
+
+    print("Video Profanity Censor (batch mode)")
+    print(f"Input folder: {folder}")
+    print(f"Model size: {args.model_size or 'auto-select'}")
+    print(f"Censor mode: {args.mode}")
+
+    if not videos:
+        print(f"\nNo supported video files found in: {folder}")
+        supported = ", ".join(sorted(InputValidator.SUPPORTED_FORMATS))
+        print(f"Supported formats: {supported}")
         return 1
+
+    filtered_dir = folder / FILTERED_DIR_NAME
+    filtered_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Output folder: {filtered_dir}")
+    print(f"Found {len(videos)} video file(s) to process.\n")
+
+    engine = CensorEngine()
+    succeeded: list[str] = []
+    failed: list[tuple[str, str]] = []
+
+    for i, video in enumerate(videos, start=1):
+        print("=" * 60)
+        print(f"[{i}/{len(videos)}] {video.name}")
+        print("=" * 60)
+
+        # Output and report land in the filtered/ subfolder, keyed off the source name.
+        output_path = filtered_dir / f"{video.stem}_censored{video.suffix}"
+        report_path = filtered_dir / f"{video.stem}_censored_report.txt"
+
+        try:
+            result = _process_one_file(
+                engine, video, output_path, report_path, None, args, censor_mode
+            )
+        except Exception as e:  # noqa: BLE001 - never let one file abort the batch
+            print(f"Error: unexpected failure processing {video.name}: {e}")
+            failed.append((video.name, str(e)))
+            print()
+            continue
+
+        _print_result(result)
+        print()
+        if result.success:
+            succeeded.append(video.name)
+        else:
+            failed.append((video.name, result.error_message or "unknown error"))
+
+    # Batch summary
+    print("=" * 60)
+    print("Batch Summary")
+    print("=" * 60)
+    print(f"Total files: {len(videos)}")
+    print(f"Succeeded:   {len(succeeded)}")
+    print(f"Failed:      {len(failed)}")
+    if failed:
+        print("\nFailed files:")
+        for name, reason in failed:
+            print(f"  - {name}: {reason}")
+    print(f"\nCensored output written to: {filtered_dir}")
+
+    return 0 if (succeeded and not failed) else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Main CLI entry point.
+
+    Parses arguments and routes to single-file or batch (folder) processing.
+
+    Args:
+        argv: Optional list of arguments. Defaults to sys.argv[1:].
+
+    Returns:
+        Exit code: 0 for success, 1 for failure.
+    """
+    args = parse_args(argv)
+
+    input_path = Path(args.input)
+    censor_mode = _resolve_censor_mode(args.mode)
+
+    if not input_path.exists():
+        print(f"Error: input path not found: {input_path}")
+        return 1
+
+    if input_path.is_dir():
+        # Folder input => batch mode. Some single-file options are incompatible.
+        if args.output:
+            print(
+                "Error: --output names a single file and cannot be used with a folder "
+                "input. In batch mode, output goes to the 'filtered' subfolder "
+                "automatically."
+            )
+            return 1
+        if args.subtitle_path:
+            print(
+                "Error: --subtitle-path applies to a single video and cannot be used "
+                "with a folder input. Embedded subtitles are still used per-file."
+            )
+            return 1
+        if args.report_path:
+            print(
+                "Error: --report-path names a single file and cannot be used with a "
+                "folder input. Per-file reports are written to the 'filtered' subfolder."
+            )
+            return 1
+        return _run_batch(args, input_path, censor_mode)
+
+    return _run_single(args, input_path, censor_mode)
 
 
 def _format_duration(seconds: float) -> str:

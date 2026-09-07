@@ -85,8 +85,9 @@ python -m video_profanity_censor.gui
 
 The GUI lets you:
 
-- **Select the source video** with a file picker (filtered to supported formats).
-- **Select an external subtitle file** (SRT/ASS/SSA), optional. If you leave it blank, the app automatically checks the video for **embedded subtitle tracks**, same as the CLI.
+- **Choose the input mode** — a single video file, or a whole folder (batch). In folder mode every supported video is processed into a `filtered` subfolder, and the subtitle/output pickers are disabled since batch mode derives those per file.
+- **Select the source video** with a file picker (filtered to supported formats), or **select a folder** in batch mode.
+- **Select an external subtitle file** (SRT/ASS/SSA), optional (single-file mode). If you leave it blank, the app automatically checks the video for **embedded subtitle tracks**, same as the CLI.
 - **Choose the censor mode** — mute (silence) or tone (beep).
 - **Choose the output path**, optional (defaults to `<input>_censored.<ext>`).
 - **Check dependencies** with a single button that verifies FFmpeg is on your `PATH` and that all required Python packages are installed.
@@ -129,6 +130,22 @@ Use your own profanity list and force a specific model size:
 video-profanity-censor movie.mp4 --profanity-list my_words.txt --model-size large
 ```
 
+### Processing a whole folder (batch mode)
+
+Pass a folder instead of a single file and every supported video in it is processed. The censored copies and reports are written to a `filtered` subfolder inside that folder:
+
+```bash
+video-profanity-censor /home/daniel/Movies
+```
+
+For an input like `/home/daniel/Movies/movie.mkv`, the output is written to `/home/daniel/Movies/filtered/movie_censored.mkv` (with `movie_censored_report.txt` alongside it).
+
+Notes on batch mode:
+
+- Only videos directly in the folder are processed (not subfolders), and the `filtered` output folder is skipped so re-running never re-censors its own output.
+- Each file is processed independently — if one file fails (for example, an audio codec your FFmpeg build can't decode), the batch keeps going and lists the failures in a summary at the end.
+- Per-file options that name a single output (`--output`, `--report-path`, `--subtitle-path`) can't be combined with a folder input. Embedded subtitle pre-filtering still runs per file automatically.
+
 ### Supported input formats
 
 `.mp4`, `.mkv`, `.avi`, `.mov`, `.wmv` (maximum 50 GB, must contain at least one audio track).
@@ -137,14 +154,15 @@ video-profanity-censor movie.mp4 --profanity-list my_words.txt --model-size larg
 
 | Option | Description | Default |
 | --- | --- | --- |
-| `input` | Path to the input video file (required) | — |
-| `--output`, `-o` | Path for the censored output video | `<input>_censored.<ext>` |
+| `input` | Path to the input video file **or a folder** (required). A folder triggers batch mode. | — |
+| `--output`, `-o` | Path for the censored output video (single-file only) | `<input>_censored.<ext>` |
 | `--mode` | Censoring mode: `mute` (silence) or `tone` (beep) | `mute` |
 | `--audio-track` | Index of the audio track to process | `0` |
 | `--profanity-list` | Path to a custom profanity list (one word per line) | bundled default list |
-| `--report-path` | Path for the detection report | `<output>_report.txt` |
-| `--subtitle-path` | External subtitle file (SRT/ASS/SSA) for pre-filtering | none |
+| `--report-path` | Path for the detection report (single-file only) | `<output>_report.txt` |
+| `--subtitle-path` | External subtitle file (SRT/ASS/SSA) for pre-filtering (single-file only) | none |
 | `--disable-subtitle-prefilter` | Skip subtitle scanning and transcribe the full audio | off |
+| `--disable-subtitle-fallback` | Don't censor profane words that are in the subtitles but missed by audio transcription | off |
 | `--model-size` | Whisper model: `tiny`, `base`, `small`, `medium`, `large` | auto (by RAM) |
 
 ### Custom profanity lists
