@@ -3,14 +3,14 @@ ARGS (list):
 '-nostdin'
 '-y'
 '-i'
-'C:\\Users\\dspeters\\AppData\\Local\\Temp\\tmpa9gt6jug\\source.wav'
+'C:\\Users\\dspeters\\AppData\\Local\\Temp\\tmpc6nloyut\\source.wav'
 '-filter_complex'
-'[0:a]atrim=start=0.000000:end=0.270000,asetpts=PTS-STARTPTS[seg0];anullsrc=r=48000:cl=2c,atrim=duration=0.279000,asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=2c[seg1];[0:a]atrim=start=0.549000:end=3.000000,asetpts=PTS-STARTPTS[seg2];[seg0][seg1][seg2]concat=n=3:v=0:a=1[out]'
+'[0:a]atrim=start=0.000000:end=0.180000,asetpts=PTS-STARTPTS[seg0];anullsrc=r=22050:cl=2c,atrim=duration=0.441000,asetpts=PTS-STARTPTS,aformat=sample_rates=22050:channel_layouts=2c[seg1];[0:a]atrim=start=0.621000:end=3.000000,asetpts=PTS-STARTPTS[seg2];[seg0][seg1][seg2]concat=n=3:v=0:a=1[out]'
 '-map'
 '[out]'
 '-f'
 'wav'
-'C:\\Users\\dspeters\\AppData\\Local\\Temp\\tmpa9gt6jug\\output.wav'
+'C:\\Users\\dspeters\\AppData\\Local\\Temp\\tmpc6nloyut\\output.wav'
 
 FILTERGRAPH:
-[0:a]atrim=start=0.000000:end=0.270000,asetpts=PTS-STARTPTS[seg0];anullsrc=r=48000:cl=2c,atrim=duration=0.279000,asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=2c[seg1];[0:a]atrim=start=0.549000:end=3.000000,asetpts=PTS-STARTPTS[seg2];[seg0][seg1][seg2]concat=n=3:v=0:a=1[out]
+[0:a]atrim=start=0.000000:end=0.180000,asetpts=PTS-STARTPTS[seg0];anullsrc=r=22050:cl=2c,atrim=duration=0.441000,asetpts=PTS-STARTPTS,aformat=sample_rates=22050:channel_layouts=2c[seg1];[0:a]atrim=start=0.621000:end=3.000000,asetpts=PTS-STARTPTS[seg2];[seg0][seg1][seg2]concat=n=3:v=0:a=1[out]
