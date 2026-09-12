@@ -1159,3 +1159,121 @@ class TestCensorBehavioralPreservation:
             assert result.segments_censored == 0
             assert result.total_censored_duration == 0.0
             assert out.read_bytes() == src.read_bytes(), "Passthrough copy differs from input"
+
+
+# ============================================================================
+# Regression: many-window censoring must not blow up (FFmpeg filtergraph cost)
+# ============================================================================
+#
+# WHY THIS TEST EXISTS
+# --------------------
+# A performance regression made the audio-censoring stage hang (FFmpeg alive at
+# low CPU, effectively forever) on real feature films. The cause was the way the
+# FFmpeg filter was built: a single timeline `volume=enable='between(t,a,b)+...'`
+# with `eval=frame`. With hundreds/thousands of detection windows the enable
+# expression had that many `between()` terms, and `eval=frame` re-evaluated the
+# ENTIRE expression on EVERY audio frame — a per-frame cost of
+# (num_frames) x (num_windows) that explodes on a 2-hour track. Short clips / few
+# detections never showed it, so the earlier tests passed.
+#
+# The fix replaces the per-frame timeline `enable` with a SEGMENT-BASED
+# `concat` filtergraph whose cost scales with the NUMBER OF SEGMENTS
+# (~2 * num_windows + 1), with NO per-frame expression.
+#
+# This test guards against reintroducing the per-frame enable-expression blowup:
+# it censors a SHORT (few-second) multichannel track with MANY (200+) tiny
+# non-overlapping detections and asserts censor() completes well within a
+# generous wall-clock timeout for BOTH MUTE and TONE, and that the output
+# duration matches the input. The buffer is deliberately small so CI stays fast;
+# it is the NUMBER OF WINDOWS (not track length) that stresses the old code path.
+
+import time as _time
+
+
+class TestManyWindowCensoringPerformance:
+    """Guards against the per-frame enable-expression blowup on many windows.
+
+    With the old timeline `enable`/`eval=frame` filter, censoring a track with
+    hundreds of windows scaled as frames x windows and effectively hung. The
+    segment-based `concat` filtergraph scales with the number of segments, so
+    this completes quickly.
+
+    **Validates: Requirements 2.1, 2.2**
+    """
+
+    CHANNELS = 6
+    SAMPLE_RATE = 48000
+    # Short track (keeps CI fast); the stressor is the window COUNT, not length.
+    DURATION_MS = 6000
+    NUM_WINDOWS = 220
+    WALL_CLOCK_TIMEOUT_S = 30.0
+
+    def _make_many_detections(self, mode: CensorMode) -> list[Detection]:
+        """Build 200+ tiny, non-overlapping detections packed into the track.
+
+        Windows are ~15ms with ~10ms gaps so they stay disjoint; the point is a
+        large window COUNT, which is what stressed the old per-frame expression.
+        """
+        detections: list[Detection] = []
+        word_ms = 15
+        gap_ms = 10
+        step_ms = word_ms + gap_ms
+        start_offset_ms = 100
+        for i in range(self.NUM_WINDOWS):
+            start_ms = start_offset_ms + i * step_ms
+            end_ms = start_ms + word_ms
+            if end_ms >= self.DURATION_MS - 100:
+                break
+            detections.append(
+                Detection(
+                    word=f"w{i}",
+                    timestamp_range=TimestampRange(
+                        start=start_ms / 1000.0, end=end_ms / 1000.0
+                    ),
+                    censor_action=mode,
+                )
+            )
+        return detections
+
+    @pytest.mark.parametrize("mode", [CensorMode.MUTE, CensorMode.TONE])
+    def test_many_windows_complete_quickly(self, mode: CensorMode):
+        """200+ windows must censor within a generous timeout for MUTE and TONE.
+
+        Old (per-frame enable) code path: effectively hangs. New (segment concat)
+        path: completes in well under the timeout.
+        """
+        source_audio = _create_test_audio(
+            channels=self.CHANNELS,
+            sample_rate=self.SAMPLE_RATE,
+            duration_ms=self.DURATION_MS,
+        )
+        detections = self._make_many_detections(mode)
+        # Confirm we really are exercising a large window count.
+        assert len(detections) >= 200, (
+            f"expected 200+ windows, generated {len(detections)}"
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            src = Path(tmp_dir) / "src.wav"
+            out = Path(tmp_dir) / "out.wav"
+            source_audio.export(str(src), format="wav")
+
+            start = _time.monotonic()
+            AudioProcessor(mode=mode, tone_freq=1000).censor(
+                audio_path=src, detections=detections, output_path=out
+            )
+            elapsed = _time.monotonic() - start
+
+            assert elapsed < self.WALL_CLOCK_TIMEOUT_S, (
+                f"censor() with {len(detections)} windows took {elapsed:.1f}s "
+                f"(> {self.WALL_CLOCK_TIMEOUT_S}s). This indicates the per-frame "
+                "enable-expression blowup has been reintroduced (cost scaling as "
+                "frames x windows instead of with the segment count)."
+            )
+
+            assert out.exists() and out.stat().st_size > 0
+            output = AudioSegment.from_file(str(out))
+            assert abs(len(output) - len(source_audio)) <= 2, (
+                f"Output duration {len(output)}ms differs from input "
+                f"{len(source_audio)}ms"
+            )

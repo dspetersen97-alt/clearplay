@@ -240,6 +240,7 @@ class AudioProcessor:
             audio_path=audio_path,
             output_path=output_path,
             windows=merged_windows,
+            audio_duration_ms=audio_duration_ms,
             sample_rate=sample_rate,
             channels=channels,
             crossfade_ms=crossfade_ms,
@@ -334,21 +335,43 @@ class AudioProcessor:
                 merged.append((start_ms, end_ms))
         return merged
 
-    def _build_enable_expr(self, windows: list[tuple[int, int]]) -> str:
-        """Builds an FFmpeg ``enable`` expression true within any censored window.
+    @staticmethod
+    def _build_segments(
+        windows: list[tuple[int, int]], audio_duration_ms: int
+    ) -> list[tuple[int, int, bool]]:
+        """Splits ``[0, audio_duration_ms)`` into ordered pass-through/censored segments.
+
+        Given the merged, disjoint censored windows, this walks the timeline once and
+        emits an alternating sequence of segments covering the whole track: the gaps
+        between windows are source (pass-through) segments and each merged window is a
+        censored segment. This is the input to the segment-based ``concat`` filtergraph,
+        whose cost scales with the number of segments (~``2 * len(windows) + 1``) rather
+        than with frames x windows.
 
         Args:
-            windows: Disjoint (start_ms, end_ms) windows.
+            windows: Merged, disjoint ``(start_ms, end_ms)`` censored windows.
+            audio_duration_ms: Total track duration in ms.
 
         Returns:
-            An FFmpeg timeline expression string (sum of ``between(t,start,end)`` terms).
+            Ordered list of ``(start_ms, end_ms, is_censored)`` segments. Zero-length
+            segments are omitted so ``concat`` never receives an empty input.
         """
-        terms = []
+        segments: list[tuple[int, int, bool]] = []
+        cursor = 0
         for start_ms, end_ms in windows:
-            start_s = start_ms / 1000.0
-            end_s = end_ms / 1000.0
-            terms.append(f"between(t,{start_s:.6f},{end_s:.6f})")
-        return "+".join(terms)
+            # Clamp window to the track bounds defensively (windows are already
+            # clamped in Phase A, but keep this robust to edge cases).
+            start_ms = max(0, min(start_ms, audio_duration_ms))
+            end_ms = max(0, min(end_ms, audio_duration_ms))
+            if start_ms > cursor:
+                # Pass-through gap before this censored window.
+                segments.append((cursor, start_ms, False))
+            if end_ms > start_ms:
+                segments.append((start_ms, end_ms, True))
+                cursor = end_ms
+        if cursor < audio_duration_ms:
+            segments.append((cursor, audio_duration_ms, False))
+        return segments
 
     def _channel_pan_filter(self, channels: int) -> str:
         """Builds a ``pan`` filter that fans a mono source out to N channels.
@@ -371,6 +394,7 @@ class AudioProcessor:
         audio_path: Path,
         output_path: Path,
         windows: list[tuple[int, int]],
+        audio_duration_ms: int,
         sample_rate: int,
         channels: int,
         crossfade_ms: int,
@@ -378,96 +402,171 @@ class AudioProcessor:
     ) -> None:
         """Runs FFmpeg to censor the given windows, streaming input to output.
 
-        MUTE: sets ``volume=0`` inside the censored windows (source passes through
-        elsewhere). TONE: mutes the source inside the windows and mixes in a sine tone
-        (freq=self.tone_freq, ~-20 dBFS) gated to the same windows, fanned out to the
-        source channel count. Neither path decodes the full PCM into a Python buffer.
+        The timeline is split into an alternating sequence of pass-through source
+        segments (the gaps between windows) and censored replacement segments (each
+        merged window), which are then ``concat``-ed back together in order. This
+        makes the filtergraph cost scale with the NUMBER OF SEGMENTS
+        (~``2 * len(windows) + 1``) rather than with ``frames x windows`` — there is
+        NO per-frame timeline expression, which is what made long feature films crawl.
+
+        MUTE: each censored segment is replaced by generated silence of the exact
+        segment duration (trivial cost). TONE: each censored segment is a generated
+        sine (freq=self.tone_freq, ~-20 dBFS) fanned to the source channel count, with
+        the same 10ms boundary fade rule as before (only when the segment is longer
+        than ``2 * crossfade_ms``). All censored segments are forced to the source
+        sample rate and channel count so ``concat`` accepts them. Everything streams
+        through a single FFmpeg subprocess, so peak memory stays bounded and
+        independent of track length (the full PCM is never buffered in Python).
 
         Args:
             audio_path: Input WAV path.
             output_path: Output path.
             windows: Disjoint censored windows (ms).
+            audio_duration_ms: Total track duration in ms (used to derive segments).
             sample_rate: Source sample rate.
             channels: Source channel count.
-            crossfade_ms: Boundary fade duration in ms (applied to toned regions).
+            crossfade_ms: Boundary fade duration in ms (applied to toned segments).
             export_params: Params from ``_build_export_params`` (format/codec/etc.).
 
         Raises:
             RuntimeError: If the FFmpeg invocation fails.
         """
-        enable = self._build_enable_expr(windows)
+        segments = self._build_segments(windows, audio_duration_ms)
+
+        filtergraph, concat_out = self._build_segment_filtergraph(
+            segments=segments,
+            sample_rate=sample_rate,
+            channels=channels,
+            crossfade_ms=crossfade_ms,
+        )
 
         cmd = ["ffmpeg", "-y", "-i", str(audio_path)]
 
-        if self.mode == CensorMode.MUTE:
-            # Silence the source inside the censored windows; pass through elsewhere.
-            audio_filter = f"volume=enable='{enable}':volume=0:eval=frame"
-            cmd += ["-af", audio_filter]
+        # For a very large filtergraph, pass it via a temp script file to avoid
+        # exceeding OS command-line length limits. Otherwise inline it.
+        script_path: Path | None = None
+        # ~120k chars is well under typical limits (Windows ~32k for a single arg,
+        # but ffmpeg reads -filter_complex as one arg; be conservative).
+        if len(filtergraph) > 8000:
+            import tempfile
+
+            fd, tmp_name = tempfile.mkstemp(suffix=".ffscript", text=True)
+            script_path = Path(tmp_name)
+            with __import__("os").fdopen(fd, "w") as fh:
+                fh.write(filtergraph)
+            cmd += ["-filter_complex_script", str(script_path)]
         else:
-            # TONE: mute source in windows, generate a gated sine, mix them.
-            # ~-20 dBFS => linear amplitude ~0.1.
-            tone_amplitude = 0.1
-            not_enable = f"1-({enable})"
-            pan = self._channel_pan_filter(channels)
-            fade = self._tone_fade_expr(windows, crossfade_ms)
+            cmd += ["-filter_complex", filtergraph]
 
-            filtergraph = (
-                f"[0:a]volume=enable='{enable}':volume=0:eval=frame[src];"
-                f"sine=frequency={self.tone_freq}:sample_rate={sample_rate},"
-                f"volume={tone_amplitude},{pan},"
-                # Keep the tone only inside the censored windows.
-                f"volume=enable='{not_enable}':volume=0:eval=frame"
-                f"{fade}[beep];"
-                f"[src][beep]amix=inputs=2:normalize=0:duration=first[out]"
-            )
-            cmd += ["-filter_complex", filtergraph, "-map", "[out]"]
-
+        cmd += ["-map", concat_out]
         cmd += self._export_params_to_ffmpeg_args(export_params)
         cmd.append(str(output_path))
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"FFmpeg censoring failed: {result.stderr.strip()}"
-            )
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"FFmpeg censoring failed: {result.stderr.strip()}"
+                )
+        finally:
+            if script_path is not None:
+                script_path.unlink(missing_ok=True)
 
-    def _tone_fade_expr(
-        self, windows: list[tuple[int, int]], crossfade_ms: int
-    ) -> str:
-        """Builds per-window boundary fades for the toned replacement.
+    def _build_segment_filtergraph(
+        self,
+        segments: list[tuple[int, int, bool]],
+        sample_rate: int,
+        channels: int,
+        crossfade_ms: int,
+    ) -> tuple[str, str]:
+        """Builds a segment-based ``concat`` filtergraph for the given segments.
 
-        Preserves the previous behavior of applying a 10ms fade in/out on the
-        replacement only when the window is longer than ``2 * crossfade_ms``. Windows
-        at or below that threshold get no fade (matching ``_apply_crossfade``). Fades
-        smooth the tone at window edges and avoid audible clicks.
+        Each source segment is an ``atrim`` of the input; each censored segment is
+        generated (silence for MUTE, sine for TONE) at the exact duration and forced
+        to the source sample rate and channel count. Segments are concatenated in
+        timeline order.
 
         Args:
-            windows: Disjoint censored windows (ms).
+            segments: Ordered ``(start_ms, end_ms, is_censored)`` segments.
+            sample_rate: Source sample rate.
+            channels: Source channel count.
+            crossfade_ms: Boundary fade duration in ms (toned segments only).
+
+        Returns:
+            ``(filtergraph_string, concat_output_label)``.
+        """
+        chains: list[str] = []
+        labels: list[str] = []
+
+        tone_amplitude = 0.1  # ~-20 dBFS linear amplitude.
+
+        for idx, (start_ms, end_ms, is_censored) in enumerate(segments):
+            start_s = start_ms / 1000.0
+            end_s = end_ms / 1000.0
+            dur_s = (end_ms - start_ms) / 1000.0
+            label = f"seg{idx}"
+
+            if not is_censored:
+                # Pass-through source slice.
+                chains.append(
+                    f"[0:a]atrim=start={start_s:.6f}:end={end_s:.6f},"
+                    f"asetpts=PTS-STARTPTS[{label}]"
+                )
+            elif self.mode == CensorMode.MUTE:
+                # Generate exact-duration silence matching the source format.
+                chains.append(
+                    f"anullsrc=r={sample_rate}:cl={channels}c,"
+                    f"atrim=duration={dur_s:.6f},asetpts=PTS-STARTPTS,"
+                    f"aformat=sample_rates={sample_rate}:channel_layouts={channels}c"
+                    f"[{label}]"
+                )
+            else:
+                # Generate a sine tone segment, fan to the source channel count,
+                # and apply the boundary fade rule (relative to the segment).
+                pan = self._channel_pan_filter(channels)
+                fade = self._segment_fade_chain(end_ms - start_ms, crossfade_ms)
+                chains.append(
+                    f"sine=frequency={self.tone_freq}:sample_rate={sample_rate}:"
+                    f"duration={dur_s:.6f},"
+                    f"volume={tone_amplitude},{pan}{fade},"
+                    f"aformat=sample_rates={sample_rate}:channel_layouts={channels}c,"
+                    f"asetpts=PTS-STARTPTS[{label}]"
+                )
+            labels.append(f"[{label}]")
+
+        concat_out = "[out]"
+        concat_inputs = "".join(labels)
+        chains.append(
+            f"{concat_inputs}concat=n={len(labels)}:v=0:a=1{concat_out}"
+        )
+        return ";".join(chains), concat_out
+
+    def _segment_fade_chain(self, duration_ms: int, crossfade_ms: int) -> str:
+        """Builds the per-segment boundary fade chain for a toned replacement.
+
+        Preserves the previous behavior of applying a 10ms fade in/out on the
+        replacement only when the segment is longer than ``2 * crossfade_ms``.
+        Segments at or below that threshold get no fade (matching ``_apply_crossfade``).
+        Fades are expressed RELATIVE to the segment (``st=0`` and
+        ``st=dur-crossfade``) because each segment is generated independently and
+        reset to ``PTS-STARTPTS``.
+
+        Args:
+            duration_ms: Segment duration in ms.
             crossfade_ms: Fade duration in ms.
 
         Returns:
             An FFmpeg filter chain fragment beginning with ``,`` (or empty string).
         """
-        if crossfade_ms <= 0:
+        if crossfade_ms <= 0 or duration_ms <= crossfade_ms * 2:
             return ""
 
         fade_s = crossfade_ms / 1000.0
-        parts: list[str] = []
-        for start_ms, end_ms in windows:
-            duration_ms = end_ms - start_ms
-            if duration_ms <= crossfade_ms * 2:
-                continue
-            start_s = start_ms / 1000.0
-            fade_out_start = (end_ms - crossfade_ms) / 1000.0
-            parts.append(
-                f"afade=t=in:st={start_s:.6f}:d={fade_s:.6f}:curve=tri"
-            )
-            parts.append(
-                f"afade=t=out:st={fade_out_start:.6f}:d={fade_s:.6f}:curve=tri"
-            )
-        if not parts:
-            return ""
-        return "," + ",".join(parts)
+        fade_out_start_s = (duration_ms - crossfade_ms) / 1000.0
+        return (
+            f",afade=t=in:st=0:d={fade_s:.6f}:curve=tri"
+            f",afade=t=out:st={fade_out_start_s:.6f}:d={fade_s:.6f}:curve=tri"
+        )
 
     @staticmethod
     def _export_params_to_ffmpeg_args(export_params: dict) -> list[str]:
