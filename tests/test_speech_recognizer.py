@@ -477,3 +477,94 @@ class TestMockWhisperPredictableOutput:
 
         assert result.has_speech is False
         assert any("not found" in w.lower() for w in result.warnings)
+
+
+class TestRegionTranscriptionTimeout:
+    """Regression tests for the per-region hard wall-clock timeout (hang guard).
+
+    Guards against the real "never finishes" hang observed on a full 2h27m movie
+    (The Martian) run: a py-spy/faulthandler trace proved the process was NOT
+    deadlocked in our code but stuck inside faster-whisper's decode/temperature-
+    fallback loop while transcribing a music-heavy region, and it never returned.
+
+    VAD + a tamed fallback ladder address the root cause, but the timeout is the
+    safety net that GUARANTEES the whole job always finishes: a region whose
+    in-process whisper decode blocks must be abandoned and skipped-with-warning so
+    the remaining regions still produce results. These tests inject a blocking
+    ``_run_transcription`` under a temporarily-small timeout and assert the job does
+    not hang, returns, skips the offending region, and keeps results from the rest.
+    """
+
+    def test_blocking_region_is_skipped_and_job_returns(self, tmp_path, monkeypatch):
+        """A region whose transcription blocks past the timeout is skipped, not hung."""
+        import time
+
+        import video_profanity_censor.speech_recognizer as sr_mod
+
+        audio_file = tmp_path / "test.wav"
+        audio_file.write_bytes(b"\x00" * 100)
+
+        recognizer = SpeechRecognizer(model_size="medium", backend=AccelerationBackend.CPU)
+        recognizer._model = {
+            "type": "cpu",
+            "model_size": "medium",
+            "whisper_model": MagicMock(),
+        }
+
+        regions = [
+            ProfanityRegion(
+                start=5.0, end=10.0,
+                source_cues=[SubtitleCue(index=1, start=6.0, end=8.0, text="good")],
+            ),
+            ProfanityRegion(
+                start=20.0, end=25.0,
+                source_cues=[SubtitleCue(index=2, start=21.0, end=23.0, text="stuck")],
+            ),
+        ]
+
+        # Make the timeout tiny so the test is fast; the second region "blocks" for
+        # much longer than the timeout, simulating the stuck faster-whisper decode.
+        monkeypatch.setattr(sr_mod, "_REGION_TRANSCRIPTION_TIMEOUT_S", 0.2)
+
+        good_result = TranscriptionResult(
+            words=[TranscribedWord(word="hello", start=0.5, end=1.0, confidence=0.9)],
+            has_speech=True,
+        )
+
+        call_count = {"n": 0}
+
+        def fake_run_transcription(audio_path, progress_callback=None):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return good_result
+            # Second region blocks well beyond the (tiny) timeout.
+            time.sleep(5.0)
+            return good_result  # pragma: no cover - should be abandoned first
+
+        monkeypatch.setattr(recognizer, "_run_transcription", fake_run_transcription)
+
+        # Bypass ffmpeg extraction so we exercise the timeout path directly.
+        def fake_subprocess_run(*args, **kwargs):
+            fake = MagicMock()
+            fake.returncode = 0
+            fake.stderr = ""
+            return fake
+
+        monkeypatch.setattr("subprocess.run", fake_subprocess_run)
+
+        start = time.monotonic()
+        result = recognizer._transcribe_regions(audio_file, regions)
+        elapsed = time.monotonic() - start
+
+        # (a) does NOT hang: must return quickly, well before the 5s block would end.
+        assert elapsed < 4.0
+        # (b) returns a TranscriptionResult
+        assert isinstance(result, TranscriptionResult)
+        # (d) still returns results from the healthy region
+        assert len(result.words) == 1
+        assert result.words[0].word == "hello"
+        # (c) skips the offending region with a warning
+        assert len(result.skipped_ranges) == 1
+        assert result.skipped_ranges[0].start == 20.0
+        assert result.skipped_ranges[0].end == 25.0
+        assert any("20.000" in w or "25.000" in w for w in result.warnings)

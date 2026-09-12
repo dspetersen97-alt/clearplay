@@ -1,6 +1,7 @@
-.kiro/
+﻿.kiro/
 .hypothesis/
 video_profanity_censor/__pycache__/
 tests/__pycache__/
 *.pyc
 video_profanity_censor.egg-info/
+hang_trace.txt

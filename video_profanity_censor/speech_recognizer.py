@@ -3,6 +3,7 @@
 import logging
 import os
 import tempfile
+import threading
 from pathlib import Path
 
 from video_profanity_censor.models import (
@@ -23,6 +24,15 @@ logger = logging.getLogger(__name__)
 # still gets censored without muting an unbounded span; the audio processor further
 # bounds the final window by its own max_word_duration_ms cap.
 _DEFAULT_WORD_DURATION_S: float = 0.5
+
+
+# Hard per-region wall-clock timeout (seconds) for whisper transcription. Even with
+# VAD + a tamed fallback ladder, this is the safety net that guarantees the whole job
+# ALWAYS finishes: no single region may block forever. A healthy ~5-8s region finishes
+# in seconds, so 5 minutes is very generous. The whisper work runs IN-PROCESS while
+# iterating the CTranslate2 segments generator; a stuck native decode cannot be killed
+# cleanly from Python, so we run it in a daemon worker thread and abandon it on timeout.
+_REGION_TRANSCRIPTION_TIMEOUT_S: float = 300.0
 
 
 def _repair_word_timing(start, end):
@@ -295,6 +305,18 @@ class SpeechRecognizer:
                 all_warnings.extend(region_result.warnings)
                 all_skipped.extend(region_result.skipped_ranges)
 
+                # Report progress based on COMPLETED regions so the bar reflects work
+                # actually finished, not just started. Previously the last region sat
+                # at ~100% for its whole (potentially slow) duration, making a slow or
+                # stuck region look like a hang at "100%".
+                if progress_callback:
+                    completed_percent = ((i + 1) / len(regions)) * 100.0
+                    progress_callback(
+                        ProcessingStage.TRANSCRIPTION,
+                        completed_percent,
+                        f"Completed region {i + 1}/{len(regions)}.",
+                    )
+
             except Exception as e:
                 # Skip corrupted segments and continue with warning (Req 2.8)
                 warning_msg = (
@@ -371,9 +393,12 @@ class SpeechRecognizer:
                     f"FFmpeg failed to extract region: {result.stderr.strip()}"
                 )
 
-            # Transcribe the extracted segment
+            # Transcribe the extracted segment, guarded by a hard wall-clock timeout
+            # (CHANGE 3). The whisper decode runs in-process inside CTranslate2 and can
+            # spin forever on pathological audio; a daemon worker thread with a bounded
+            # join lets us abandon a stuck region and continue with the rest.
             try:
-                segment_result = self._run_transcription(tmp_path, progress_callback=None)
+                segment_result = self._run_transcription_with_timeout(tmp_path)
             except MemoryError:
                 segment_result = self._handle_oom(tmp_path, progress_callback=None)
             except RuntimeError as e:
@@ -439,6 +464,60 @@ class SpeechRecognizer:
             except OSError:
                 pass
 
+    def _run_transcription_with_timeout(
+        self,
+        audio_path: Path,
+    ) -> TranscriptionResult:
+        """Runs ``_run_transcription`` under a hard wall-clock timeout.
+
+        The whisper decode happens in-process inside CTranslate2 while iterating the
+        returned segments generator. A signal/thread interrupt of the main thread is
+        unreliable on Windows and cannot cleanly cancel the C++ decode, so we run the
+        work in a daemon worker thread and bound it with ``join(timeout=...)``.
+
+        If the worker completes in time we propagate its result (or re-raise its
+        exception, preserving the OOM handling in the caller). If it does not finish
+        within ``_REGION_TRANSCRIPTION_TIMEOUT_S`` we raise a ``RuntimeError`` so the
+        existing skip-with-warning path in ``_transcribe_regions`` catches it. The
+        worker is a daemon so an abandoned (stuck) decode cannot block process exit.
+
+        Args:
+            audio_path: Path to the extracted region audio to transcribe.
+
+        Returns:
+            TranscriptionResult from the worker thread.
+
+        Raises:
+            RuntimeError: If transcription exceeds the timeout (routed to skip path).
+            Exception: Any exception raised by the underlying transcription.
+        """
+        holder: dict[str, object] = {}
+
+        def _worker() -> None:
+            try:
+                holder["result"] = self._run_transcription(
+                    audio_path, progress_callback=None
+                )
+            except BaseException as exc:  # noqa: BLE001 - re-raised on main thread
+                holder["error"] = exc
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        thread.join(_REGION_TRANSCRIPTION_TIMEOUT_S)
+
+        if thread.is_alive():
+            # The native decode is stuck. We cannot force-kill a CTranslate2 call from
+            # Python, so abandon the daemon thread and let the caller skip this region.
+            raise RuntimeError(
+                f"Region transcription exceeded {_REGION_TRANSCRIPTION_TIMEOUT_S}s; "
+                f"skipping"
+            )
+
+        if "error" in holder:
+            raise holder["error"]  # type: ignore[misc]
+
+        return holder["result"]  # type: ignore[return-value]
+
     def _run_transcription(
         self,
         audio_path: Path,
@@ -479,6 +558,22 @@ class SpeechRecognizer:
                 str(audio_path),
                 word_timestamps=True,
                 language="en",
+                # CHANGE 1: Enable faster-whisper's built-in Silero VAD so
+                # non-speech/music regions are skipped rather than decoded. This is
+                # the primary fix for the hang: on music-heavy audio (e.g. a disco
+                # soundtrack over dialogue) the decoder otherwise churns/hallucinates
+                # on musical segments and can spin indefinitely.
+                vad_filter=True,
+                vad_parameters=dict(min_silence_duration_ms=500),
+                # CHANGE 2: Tame the temperature-fallback / repetition loop that makes
+                # generate_with_fallback spin. Disabling conditioning on previous text
+                # removes the repetition/hallucination feedback that drives endless
+                # fallback, and a bounded temperature ladder caps how many re-decodes
+                # happen per segment. The compression_ratio/log_prob thresholds are
+                # intentionally left at their defaults (2.4 / -1.0) so decode quality
+                # is preserved — we only cap the number of fallback re-decodes.
+                condition_on_previous_text=False,
+                temperature=[0.0, 0.2, 0.4],
             )
         except Exception as e:
             error_msg = str(e).lower()
