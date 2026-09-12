@@ -60,6 +60,11 @@ class AudioProcessor:
     # which that suspicious duration is logged.
     _SUSPICIOUS_DURATION_FACTOR: int = 10
 
+    # Hard wall-clock cap on the censor FFmpeg subprocess. A full feature film
+    # censors in seconds; this only trips when FFmpeg is genuinely stuck, so the
+    # job fails fast with a clear error instead of hanging forever.
+    _CENSOR_FFMPEG_TIMEOUT_S: float = 900.0
+
     def __init__(
         self, mode: CensorMode = CensorMode.MUTE, tone_freq: int = 1000,
         censor_buffer_ms: int = 100, max_word_duration_ms: int = 750,
@@ -448,13 +453,50 @@ class AudioProcessor:
         # so it broke real runs whose graph crossed the threshold (a ~40-detection
         # feature film produces a graph just over 8000 chars). With a realistic number
         # of detections the inline graph is small and fast.
-        cmd = ["ffmpeg", "-y", "-i", str(audio_path)]
+        # -nostdin: FFmpeg must never try to read from stdin. When launched from a
+        # non-interactive process with an inherited stdin, FFmpeg can block waiting on
+        # keyboard input and never return (a classic "ffmpeg hangs at low/zero CPU"
+        # cause). We both pass -nostdin AND redirect stdin to DEVNULL below as belt and
+        # suspenders.
+        cmd = ["ffmpeg", "-nostdin", "-y", "-i", str(audio_path)]
         cmd += ["-filter_complex", filtergraph]
         cmd += ["-map", concat_out]
         cmd += self._export_params_to_ffmpeg_args(export_params)
         cmd.append(str(output_path))
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        # TEMP DIAGNOSTIC: dump the exact ffmpeg command + filtergraph so a hang in
+        # this subprocess can be reproduced standalone. Remove once the censor hang
+        # is confirmed fixed.
+        try:
+            _dbg = Path.cwd() / "censor_ffmpeg_cmd.txt"
+            with open(_dbg, "w", encoding="utf-8") as _fh:
+                _fh.write("ARGS (list):\n")
+                for _a in cmd:
+                    _fh.write(repr(_a) + "\n")
+                _fh.write("\nFILTERGRAPH:\n" + filtergraph + "\n")
+            logger.info("Wrote censor ffmpeg command to %s", _dbg)
+        except Exception as _e:  # never let diagnostics break the run
+            logger.warning("Could not write censor ffmpeg debug file: %s", _e)
+
+        # A censor run over a feature-length track finishes in seconds; anything far
+        # beyond that means FFmpeg is stuck (bad stdin, a pathological filtergraph, a
+        # stalled pipe). Bound it so a hang can never freeze the whole job forever.
+        timeout_s = self._CENSOR_FFMPEG_TIMEOUT_S
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                timeout=timeout_s,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                f"FFmpeg censoring timed out after {timeout_s:.0f}s. "
+                "The censor filtergraph did not complete; the audio was not censored."
+            ) from e
+
         if result.returncode != 0:
             raise RuntimeError(
                 f"FFmpeg censoring failed: {result.stderr.strip()}"
