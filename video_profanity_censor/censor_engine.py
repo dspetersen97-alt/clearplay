@@ -299,7 +299,6 @@ class CensorEngine:
                     detection_result,
                     censor_mode,
                     progress_callback,
-                    audio_metadata=extraction_result.audio_metadata,
                 )
                 temp_files.append(censor_result.censored_audio_path)
             except Exception as e:
@@ -477,11 +476,13 @@ class CensorEngine:
     ):
         """Run audio censoring stage.
 
-        Passing ``audio_metadata`` lets the processor re-encode the censored track
-        back to the SOURCE codec/sample rate/layout. Without it the censored audio
-        is written as raw PCM/WAV, which the assembler then stream-copies verbatim —
-        leaving the output file's audio track as raw PCM (reported as ``araw``)
-        instead of the original codec.
+        The censored audio is written as fast, lossless PCM WAV (a temporary
+        intermediate). Re-encoding to the source codec is intentionally NOT done
+        here: doing so previously fed the AAC encoder a PCM-derived multi-Mbit/s
+        bitrate, which made FFmpeg churn and effectively hang on feature-length
+        tracks. The output-assembly stage owns final encoding — it re-encodes this
+        WAV to the source codec (or a fallback) at a sane bitrate — so the ``araw``
+        issue is handled there, not by an expensive redundant encode in this stage.
         """
         from video_profanity_censor.audio_processor import AudioProcessor
 

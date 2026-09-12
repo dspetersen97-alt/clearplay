@@ -273,22 +273,29 @@ class OutputAssembler:
         audio_output_idx = 0
         for idx in range(len(audio_streams)):
             if idx == audio_track_index:
-                if fallback_codec:
-                    # Re-encode censored audio to the fallback codec
-                    cmd.extend([f"-c:a:{audio_output_idx}", fallback_codec])
-                    # Preserve channel layout and use high bitrate for quality
-                    source_channels = audio_streams[idx].get("channels", 2)
-                    source_bitrate = audio_streams[idx].get("bit_rate")
-                    if source_channels:
-                        cmd.extend([f"-ac:{audio_output_idx}", str(source_channels)])
-                    # Use 640k for surround, 384k for stereo (high quality)
-                    if source_channels and source_channels > 2:
-                        cmd.extend([f"-b:a:{audio_output_idx}", "640k"])
-                    else:
-                        cmd.extend([f"-b:a:{audio_output_idx}", "384k"])
+                # The censored track arrives as lossless PCM WAV (the censor stage
+                # no longer re-encodes it — doing so hung FFmpeg on long tracks). So
+                # we ALWAYS re-encode the replaced track here to a real codec; never
+                # stream-copy it (that would leave the output audio as raw PCM, the
+                # 'araw' bug). Use the source codec when FFmpeg supports encoding it,
+                # otherwise the AC3/EAC3 fallback. Bitrate is a sane, encoder-friendly
+                # value (640k surround / 384k stereo), NOT the source's PCM-derived
+                # multi-Mbit/s figure.
+                source_channels = audio_streams[idx].get("channels", 2) or 2
+                target_codec = fallback_codec or audio_streams[idx].get("codec_name", "")
+                # If the source codec isn't one we can encode to, fall back.
+                if target_codec not in SUPPORTED_AUDIO_CODECS:
+                    target_codec = (
+                        FALLBACK_CODEC_HIGH_CHANNEL
+                        if source_channels > 6
+                        else FALLBACK_CODEC
+                    )
+                cmd.extend([f"-c:a:{audio_output_idx}", target_codec])
+                cmd.extend([f"-ac:{audio_output_idx}", str(source_channels)])
+                if source_channels > 2:
+                    cmd.extend([f"-b:a:{audio_output_idx}", "640k"])
                 else:
-                    # The censored audio is already encoded properly - stream copy it
-                    cmd.extend([f"-c:a:{audio_output_idx}", "copy"])
+                    cmd.extend([f"-b:a:{audio_output_idx}", "384k"])
             else:
                 # Other audio tracks: stream copy
                 cmd.extend([f"-c:a:{audio_output_idx}", "copy"])

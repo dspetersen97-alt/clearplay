@@ -3,14 +3,14 @@ ARGS (list):
 '-nostdin'
 '-y'
 '-i'
-'C:\\Users\\dspeters\\AppData\\Local\\Temp\\tmp151tvhpy\\src.wav'
+'C:\\Users\\dspeters\\AppData\\Local\\Temp\\tmpa9gt6jug\\source.wav'
 '-filter_complex'
-'sine=frequency=1000:sample_rate=48000:duration=5.690000,volume=0.1,pan=6c|c0=c0|c1=c0|c2=c0|c3=c0|c4=c0|c5=c0,afade=t=in:st=0:d=0.010000:curve=tri,afade=t=out:st=5.680000:d=0.010000:curve=tri,aformat=sample_rates=48000:channel_layouts=6c,asetpts=PTS-STARTPTS[seg0];[0:a]atrim=start=5.690000:end=6.000000,asetpts=PTS-STARTPTS[seg1];[seg0][seg1]concat=n=2:v=0:a=1[out]'
+'[0:a]atrim=start=0.000000:end=0.270000,asetpts=PTS-STARTPTS[seg0];anullsrc=r=48000:cl=2c,atrim=duration=0.279000,asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=2c[seg1];[0:a]atrim=start=0.549000:end=3.000000,asetpts=PTS-STARTPTS[seg2];[seg0][seg1][seg2]concat=n=3:v=0:a=1[out]'
 '-map'
 '[out]'
 '-f'
 'wav'
-'C:\\Users\\dspeters\\AppData\\Local\\Temp\\tmp151tvhpy\\out.wav'
+'C:\\Users\\dspeters\\AppData\\Local\\Temp\\tmpa9gt6jug\\output.wav'
 
 FILTERGRAPH:
-sine=frequency=1000:sample_rate=48000:duration=5.690000,volume=0.1,pan=6c|c0=c0|c1=c0|c2=c0|c3=c0|c4=c0|c5=c0,afade=t=in:st=0:d=0.010000:curve=tri,afade=t=out:st=5.680000:d=0.010000:curve=tri,aformat=sample_rates=48000:channel_layouts=6c,asetpts=PTS-STARTPTS[seg0];[0:a]atrim=start=5.690000:end=6.000000,asetpts=PTS-STARTPTS[seg1];[seg0][seg1]concat=n=2:v=0:a=1[out]
+[0:a]atrim=start=0.000000:end=0.270000,asetpts=PTS-STARTPTS[seg0];anullsrc=r=48000:cl=2c,atrim=duration=0.279000,asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=2c[seg1];[0:a]atrim=start=0.549000:end=3.000000,asetpts=PTS-STARTPTS[seg2];[seg0][seg1][seg2]concat=n=3:v=0:a=1[out]
