@@ -440,37 +440,25 @@ class AudioProcessor:
             crossfade_ms=crossfade_ms,
         )
 
+        # Pass the filtergraph inline via -filter_complex. The graph is handed to
+        # subprocess as a single argument (no shell involved), so it is not subject
+        # to the shell command-line length limit; FFmpeg accepts large graphs this
+        # way. A previous -filter_complex_script fallback (triggered when the graph
+        # exceeded 8000 chars) was REMOVED: that option does not exist in FFmpeg 9.0+,
+        # so it broke real runs whose graph crossed the threshold (a ~40-detection
+        # feature film produces a graph just over 8000 chars). With a realistic number
+        # of detections the inline graph is small and fast.
         cmd = ["ffmpeg", "-y", "-i", str(audio_path)]
-
-        # For a very large filtergraph, pass it via a temp script file to avoid
-        # exceeding OS command-line length limits. Otherwise inline it.
-        script_path: Path | None = None
-        # ~120k chars is well under typical limits (Windows ~32k for a single arg,
-        # but ffmpeg reads -filter_complex as one arg; be conservative).
-        if len(filtergraph) > 8000:
-            import tempfile
-
-            fd, tmp_name = tempfile.mkstemp(suffix=".ffscript", text=True)
-            script_path = Path(tmp_name)
-            with __import__("os").fdopen(fd, "w") as fh:
-                fh.write(filtergraph)
-            cmd += ["-filter_complex_script", str(script_path)]
-        else:
-            cmd += ["-filter_complex", filtergraph]
-
+        cmd += ["-filter_complex", filtergraph]
         cmd += ["-map", concat_out]
         cmd += self._export_params_to_ffmpeg_args(export_params)
         cmd.append(str(output_path))
 
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"FFmpeg censoring failed: {result.stderr.strip()}"
-                )
-        finally:
-            if script_path is not None:
-                script_path.unlink(missing_ok=True)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"FFmpeg censoring failed: {result.stderr.strip()}"
+            )
 
     def _build_segment_filtergraph(
         self,
