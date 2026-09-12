@@ -63,7 +63,7 @@ class AudioProcessor:
     # Hard wall-clock cap on the censor FFmpeg subprocess. A full feature film
     # censors in seconds; this only trips when FFmpeg is genuinely stuck, so the
     # job fails fast with a clear error instead of hanging forever.
-    _CENSOR_FFMPEG_TIMEOUT_S: float = 900.0
+    _CENSOR_FFMPEG_TIMEOUT_S: float = 600.0
 
     def __init__(
         self, mode: CensorMode = CensorMode.MUTE, tone_freq: int = 1000,
