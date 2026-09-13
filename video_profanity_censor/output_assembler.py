@@ -212,6 +212,31 @@ class OutputAssembler:
                 count += 1
         return count
 
+    @staticmethod
+    def _resolve_aac_encoder() -> str:
+        """Return the fastest available AAC encoder name.
+
+        Prefers Windows MediaFoundation ``aac_mf`` (multithreaded, OS-accelerated)
+        over FFmpeg's slow single-threaded native ``aac``. Falls back to ``aac`` when
+        MediaFoundation is unavailable (non-Windows or a build without it). The probe
+        result is cached on the class so we only shell out to ffmpeg once.
+        """
+        cached = getattr(OutputAssembler, "_aac_encoder_cache", None)
+        if cached is not None:
+            return cached
+        resolved = "aac"
+        try:
+            probe = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-encoders"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if probe.returncode == 0 and "aac_mf" in probe.stdout:
+                resolved = "aac_mf"
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
+            resolved = "aac"
+        OutputAssembler._aac_encoder_cache = resolved
+        return resolved
+
     def _run_assembly(
         self,
         source_path: Path,
@@ -295,7 +320,16 @@ class OutputAssembler:
                         if source_channels > 6
                         else FALLBACK_CODEC
                     )
-                cmd.extend([f"-c:a:{audio_output_idx}", target_codec])
+                # FFmpeg's built-in "aac" encoder is single-threaded and very slow
+                # on long surround tracks (minutes for a 2.5h 5.1 film). When the
+                # target is AAC, prefer the Windows MediaFoundation encoder "aac_mf",
+                # which is dramatically faster and produces a standard AAC-LC stream.
+                # _resolve_aac_encoder() falls back to native "aac" if aac_mf is not
+                # available in this FFmpeg build.
+                encoder = target_codec
+                if target_codec == "aac":
+                    encoder = self._resolve_aac_encoder()
+                cmd.extend([f"-c:a:{audio_output_idx}", encoder])
                 cmd.extend([f"-ac:{audio_output_idx}", str(source_channels)])
                 if source_channels > 2:
                     cmd.extend([f"-b:a:{audio_output_idx}", "640k"])
