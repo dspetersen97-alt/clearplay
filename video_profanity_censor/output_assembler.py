@@ -48,7 +48,7 @@ class OutputAssembler:
 
     # Hard wall-clock cap on the assembly FFmpeg subprocess so a stuck mux/encode
     # fails fast instead of hanging forever.
-    _ASSEMBLY_FFMPEG_TIMEOUT_S: float = 60.0
+    _ASSEMBLY_FFMPEG_TIMEOUT_S: float = 1800.0
 
     def assemble(
         self,
