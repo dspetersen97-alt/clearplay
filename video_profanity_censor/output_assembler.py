@@ -46,6 +46,10 @@ FALLBACK_CODEC_HIGH_CHANNEL = "eac3"  # Used when source has > 6 channels
 class OutputAssembler:
     """Assembles the final output video by muxing censored audio with original video stream."""
 
+    # Hard wall-clock cap on the assembly FFmpeg subprocess so a stuck mux/encode
+    # fails fast instead of hanging forever.
+    _ASSEMBLY_FFMPEG_TIMEOUT_S: float = 60.0
+
     def assemble(
         self,
         source_path: Path,
@@ -243,6 +247,7 @@ class OutputAssembler:
         # Build FFmpeg command using subprocess for precise stream mapping control
         cmd = [
             "ffmpeg",
+            "-nostdin",  # never block reading stdin (a classic ffmpeg hang cause)
             "-y",  # Overwrite output
             "-i", str(source_path),  # Input 0: original video
             "-i", str(censored_audio_path),  # Input 1: censored audio
@@ -314,14 +319,32 @@ class OutputAssembler:
         # Output file
         cmd.append(str(output_path))
 
-        # Run FFmpeg
+        # TEMP DIAGNOSTIC: dump the exact assembly ffmpeg command so a hang here can
+        # be reproduced standalone. Remove once the assembly hang is confirmed fixed.
+        try:
+            _dbg = Path.cwd() / "assemble_ffmpeg_cmd.txt"
+            with open(_dbg, "w", encoding="utf-8") as _fh:
+                for _a in cmd:
+                    _fh.write(repr(_a) + "\n")
+        except Exception:
+            pass
+
+        # Run FFmpeg. -nostdin + stdin=DEVNULL prevent a stdin-wait hang; the timeout
+        # guarantees assembly can never freeze the whole job forever.
         try:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
                 check=True,
+                stdin=subprocess.DEVNULL,
+                timeout=self._ASSEMBLY_FFMPEG_TIMEOUT_S,
             )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                f"FFmpeg output assembly timed out after "
+                f"{self._ASSEMBLY_FFMPEG_TIMEOUT_S:.0f}s."
+            ) from e
         except subprocess.CalledProcessError as e:
             raise RuntimeError(
                 f"FFmpeg output assembly failed: {e.stderr}"
