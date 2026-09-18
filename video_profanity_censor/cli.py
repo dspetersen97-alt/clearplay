@@ -110,6 +110,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--from-report",
+        type=str,
+        default=None,
+        help=(
+            "Path to a detection report (.txt) whose timestamps should be used "
+            "directly, skipping transcription entirely. Run once, edit the timings "
+            "in the generated *_report.txt, then re-run with this to re-censor."
+        ),
+    )
+
+    parser.add_argument(
         "--model-size",
         type=str,
         choices=["tiny", "base", "small", "medium", "large"],
@@ -194,6 +205,7 @@ def _process_one_file(
     subtitle_path: Path | None,
     args: argparse.Namespace,
     censor_mode: CensorMode,
+    detections_path: Path | None = None,
 ):
     """Run the censoring pipeline for a single input file and return the result."""
     profanity_list_path = Path(args.profanity_list) if args.profanity_list else None
@@ -207,6 +219,7 @@ def _process_one_file(
         subtitle_path=subtitle_path,
         disable_subtitle_prefilter=args.disable_subtitle_prefilter,
         subtitle_fallback=not args.disable_subtitle_fallback,
+        detections_path=detections_path,
         model_size=args.model_size,
     )
 
@@ -216,18 +229,27 @@ def _run_single(args: argparse.Namespace, input_path: Path, censor_mode: CensorM
     output_path = Path(args.output) if args.output else None
     report_path = Path(args.report_path) if args.report_path else None
     subtitle_path = Path(args.subtitle_path) if args.subtitle_path else None
+    detections_path = Path(args.from_report) if args.from_report else None
+
+    if detections_path is not None and not detections_path.is_file():
+        print(f"Error: report file not found: {detections_path}")
+        return 1
 
     print("Video Profanity Censor")
     print(f"Input: {input_path}")
     if output_path:
         print(f"Output: {output_path}")
-    print(f"Model size: {args.model_size or 'auto-select'}")
+    if detections_path is not None:
+        print(f"Using timings from report: {detections_path} (transcription skipped)")
+    else:
+        print(f"Model size: {args.model_size or 'auto-select'}")
     print(f"Censor mode: {args.mode}")
     print()
 
     engine = CensorEngine()
     result = _process_one_file(
-        engine, input_path, output_path, report_path, subtitle_path, args, censor_mode
+        engine, input_path, output_path, report_path, subtitle_path, args, censor_mode,
+        detections_path=detections_path,
     )
 
     print()
@@ -353,6 +375,12 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 "Error: --report-path names a single file and cannot be used with a "
                 "folder input. Per-file reports are written to the 'filtered' subfolder."
+            )
+            return 1
+        if args.from_report:
+            print(
+                "Error: --from-report applies to a single video and cannot be used "
+                "with a folder input."
             )
             return 1
         return _run_batch(args, input_path, censor_mode)

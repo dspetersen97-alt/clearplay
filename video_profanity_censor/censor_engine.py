@@ -56,6 +56,7 @@ class CensorEngine:
         subtitle_path: Path | None = None,
         disable_subtitle_prefilter: bool = False,
         subtitle_fallback: bool = True,
+        detections_path: Path | None = None,
         backend: AccelerationBackend | None = None,
         model_size: str | None = None,
         progress_callback: ProgressCallback = None,
@@ -80,6 +81,12 @@ class CensorEngine:
                 subtitles but missed by the audio transcription are still censored
                 using the subtitle cue timing. Has no effect when subtitles are not
                 available or when subtitle pre-filtering is disabled.
+            detections_path: Path to a previously generated (and optionally
+                hand-edited) detection report. When provided, the timings in that
+                file are used directly and the transcription/detection stages
+                (backend detection, subtitle scan, Whisper, profanity matching) are
+                SKIPPED entirely. This powers the edit-and-rerun workflow: run once,
+                tweak the timings in the report, then re-run with this set.
             backend: Specific backend to use. None triggers auto-detection (Req 9.4).
             model_size: Whisper model size override. None uses VRAM-based selection (Req 9.6, 9.7).
             progress_callback: Optional callback receiving (stage, percent, message)
@@ -143,138 +150,161 @@ class CensorEngine:
                     total_elapsed_seconds=time.time() - start_time,
                 )
 
-            # --- Stage 3: Backend Detection ---
-            progress_callback(ProcessingStage.BACKEND_DETECTION, 0.0, "Detecting hardware acceleration...")
-            try:
-                backend_result = self._stage_detect_backend(backend)
-                if backend_result.error_message:
+            if detections_path is not None:
+                # --- Detections-from-report bypass ---
+                # Use the report's timings directly and skip backend detection,
+                # profanity-list loading, subtitle scanning, Whisper transcription,
+                # and profanity matching. Powers the edit-and-rerun workflow.
+                try:
+                    detection_result = self._stage_load_detections(
+                        detections_path, censor_mode
+                    )
+                except Exception as e:
+                    self._cleanup_temp_files(temp_files)
                     return ProcessingResult(
                         success=False,
-                        error_message=backend_result.error_message,
+                        error_message=f"Failed to load detections from report: {e}",
+                        error_stage=ProcessingStage.PROFANITY_DETECTION,
+                        total_elapsed_seconds=time.time() - start_time,
+                    )
+                progress_callback(
+                    ProcessingStage.PROFANITY_DETECTION,
+                    100.0,
+                    f"Loaded {len(detection_result.detections)} detection(s) from report",
+                )
+            else:
+                # --- Stage 3: Backend Detection ---
+                progress_callback(ProcessingStage.BACKEND_DETECTION, 0.0, "Detecting hardware acceleration...")
+                try:
+                    backend_result = self._stage_detect_backend(backend)
+                    if backend_result.error_message:
+                        return ProcessingResult(
+                            success=False,
+                            error_message=backend_result.error_message,
+                            error_stage=ProcessingStage.BACKEND_DETECTION,
+                            total_elapsed_seconds=time.time() - start_time,
+                        )
+                    # Determine active backend and model size
+                    active_backend = backend_result.selected_backend
+                    if model_size is not None:
+                        model_size_used = model_size
+                    else:
+                        model_size_used = backend_result.selected_model_size
+                except Exception as e:
+                    return ProcessingResult(
+                        success=False,
+                        error_message=f"Backend detection failed: {e}",
                         error_stage=ProcessingStage.BACKEND_DETECTION,
                         total_elapsed_seconds=time.time() - start_time,
                     )
-                # Determine active backend and model size
-                active_backend = backend_result.selected_backend
-                if model_size is not None:
-                    model_size_used = model_size
-                else:
-                    model_size_used = backend_result.selected_model_size
-            except Exception as e:
-                return ProcessingResult(
-                    success=False,
-                    error_message=f"Backend detection failed: {e}",
-                    error_stage=ProcessingStage.BACKEND_DETECTION,
-                    total_elapsed_seconds=time.time() - start_time,
-                )
-            progress_callback(ProcessingStage.BACKEND_DETECTION, 100.0, f"Using {active_backend.value} backend with {model_size_used} model")
+                progress_callback(ProcessingStage.BACKEND_DETECTION, 100.0, f"Using {active_backend.value} backend with {model_size_used} model")
 
-            # --- Stage 4: Load Profanity List ---
-            try:
-                profanity_list = load_profanity_list(profanity_list_path)
-            except Exception as e:
-                return ProcessingResult(
-                    success=False,
-                    error_message=f"Failed to load profanity list: {e}",
-                    error_stage=ProcessingStage.PROFANITY_DETECTION,
-                    total_elapsed_seconds=time.time() - start_time,
-                    active_backend=active_backend,
-                    model_size_used=model_size_used,
-                )
-
-            # --- Stage 5: Subtitle Scanning (optional) ---
-            subtitle_scan_result: SubtitleScanResult | None = None
-            if not disable_subtitle_prefilter:
-                progress_callback(ProcessingStage.SUBTITLE_SCANNING, 0.0, "Scanning subtitles for profanity...")
+                # --- Stage 4: Load Profanity List ---
                 try:
-                    subtitle_scan_result = self._stage_scan_subtitles(
-                        input_path, subtitle_path, profanity_list
-                    )
+                    profanity_list = load_profanity_list(profanity_list_path)
                 except Exception as e:
                     return ProcessingResult(
                         success=False,
-                        error_message=f"Subtitle scanning failed: {e}",
-                        error_stage=ProcessingStage.SUBTITLE_SCANNING,
+                        error_message=f"Failed to load profanity list: {e}",
+                        error_stage=ProcessingStage.PROFANITY_DETECTION,
                         total_elapsed_seconds=time.time() - start_time,
                         active_backend=active_backend,
                         model_size_used=model_size_used,
                     )
-                progress_callback(ProcessingStage.SUBTITLE_SCANNING, 100.0, "Subtitle scan complete")
 
-                # Short-circuit: subtitles available but no profanity found (Req 8.7)
-                if subtitle_scan_result.has_subtitles and subtitle_scan_result.skipped_speech_recognition:
-                    # No profanity found — skip output file creation
-                    self._generate_report(DetectionResult(), report_path)
+                # --- Stage 5: Subtitle Scanning (optional) ---
+                subtitle_scan_result: SubtitleScanResult | None = None
+                if not disable_subtitle_prefilter:
+                    progress_callback(ProcessingStage.SUBTITLE_SCANNING, 0.0, "Scanning subtitles for profanity...")
+                    try:
+                        subtitle_scan_result = self._stage_scan_subtitles(
+                            input_path, subtitle_path, profanity_list
+                        )
+                    except Exception as e:
+                        return ProcessingResult(
+                            success=False,
+                            error_message=f"Subtitle scanning failed: {e}",
+                            error_stage=ProcessingStage.SUBTITLE_SCANNING,
+                            total_elapsed_seconds=time.time() - start_time,
+                            active_backend=active_backend,
+                            model_size_used=model_size_used,
+                        )
+                    progress_callback(ProcessingStage.SUBTITLE_SCANNING, 100.0, "Subtitle scan complete")
+
+                    # Short-circuit: subtitles available but no profanity found (Req 8.7)
+                    if subtitle_scan_result.has_subtitles and subtitle_scan_result.skipped_speech_recognition:
+                        # No profanity found — skip output file creation
+                        self._generate_report(DetectionResult(), report_path)
+                        self._cleanup_temp_files(temp_files)
+                        return ProcessingResult(
+                            success=True,
+                            output_path=None,
+                            report_path=report_path,
+                            total_elapsed_seconds=time.time() - start_time,
+                            profane_instances_detected=0,
+                            profane_instances_censored=0,
+                            active_backend=active_backend,
+                            model_size_used=model_size_used,
+                        )
+
+                # --- Stage 6: Transcription ---
+                progress_callback(ProcessingStage.TRANSCRIPTION, 0.0, "Transcribing audio...")
+                try:
+                    transcription_result = self._stage_transcribe(
+                        extraction_result.output_path,
+                        active_backend,
+                        model_size_used,
+                        subtitle_scan_result,
+                        progress_callback,
+                    )
+                except Exception as e:
                     self._cleanup_temp_files(temp_files)
                     return ProcessingResult(
-                        success=True,
-                        output_path=None,
-                        report_path=report_path,
+                        success=False,
+                        error_message=f"Transcription failed: {e}",
+                        error_stage=ProcessingStage.TRANSCRIPTION,
                         total_elapsed_seconds=time.time() - start_time,
-                        profane_instances_detected=0,
-                        profane_instances_censored=0,
                         active_backend=active_backend,
                         model_size_used=model_size_used,
                     )
+                progress_callback(ProcessingStage.TRANSCRIPTION, 100.0, "Transcription complete")
 
-            # --- Stage 6: Transcription ---
-            progress_callback(ProcessingStage.TRANSCRIPTION, 0.0, "Transcribing audio...")
-            try:
-                transcription_result = self._stage_transcribe(
-                    extraction_result.output_path,
-                    active_backend,
-                    model_size_used,
-                    subtitle_scan_result,
-                    progress_callback,
-                )
-            except Exception as e:
-                self._cleanup_temp_files(temp_files)
-                return ProcessingResult(
-                    success=False,
-                    error_message=f"Transcription failed: {e}",
-                    error_stage=ProcessingStage.TRANSCRIPTION,
-                    total_elapsed_seconds=time.time() - start_time,
-                    active_backend=active_backend,
-                    model_size_used=model_size_used,
-                )
-            progress_callback(ProcessingStage.TRANSCRIPTION, 100.0, "Transcription complete")
-
-            # --- Stage 7: Profanity Detection ---
-            progress_callback(ProcessingStage.PROFANITY_DETECTION, 0.0, "Detecting profanity...")
-            try:
-                detection_result = self._stage_detect_profanity(
-                    transcription_result, profanity_list, censor_mode
-                )
-            except Exception as e:
-                self._cleanup_temp_files(temp_files)
-                return ProcessingResult(
-                    success=False,
-                    error_message=f"Profanity detection failed: {e}",
-                    error_stage=ProcessingStage.PROFANITY_DETECTION,
-                    total_elapsed_seconds=time.time() - start_time,
-                    active_backend=active_backend,
-                    model_size_used=model_size_used,
-                )
-            progress_callback(ProcessingStage.PROFANITY_DETECTION, 100.0, "Profanity detection complete")
-
-            # Subtitle fallback: censor profane words that are in the subtitles but
-            # were missed by the audio transcription (e.g. muttered under the breath).
-            # Runs before the "no detections" check so a cue that Whisper missed
-            # entirely still produces an output file.
-            if subtitle_fallback:
+                # --- Stage 7: Profanity Detection ---
+                progress_callback(ProcessingStage.PROFANITY_DETECTION, 0.0, "Detecting profanity...")
                 try:
-                    fallback_detections = self._subtitle_fallback_detections(
-                        subtitle_scan_result,
-                        detection_result.detections,
-                        profanity_list,
-                        censor_mode,
+                    detection_result = self._stage_detect_profanity(
+                        transcription_result, profanity_list, censor_mode
                     )
-                    if fallback_detections:
-                        detection_result.detections.extend(fallback_detections)
                 except Exception as e:
-                    # The fallback is a safety net, not critical path — never fail the
-                    # whole run because of it; just log and continue with what we have.
-                    logger.warning(f"Subtitle fallback detection failed: {e}")
+                    self._cleanup_temp_files(temp_files)
+                    return ProcessingResult(
+                        success=False,
+                        error_message=f"Profanity detection failed: {e}",
+                        error_stage=ProcessingStage.PROFANITY_DETECTION,
+                        total_elapsed_seconds=time.time() - start_time,
+                        active_backend=active_backend,
+                        model_size_used=model_size_used,
+                    )
+                progress_callback(ProcessingStage.PROFANITY_DETECTION, 100.0, "Profanity detection complete")
+
+                # Subtitle fallback: censor profane words that are in the subtitles but
+                # were missed by the audio transcription (e.g. muttered under the breath).
+                # Runs before the "no detections" check so a cue that Whisper missed
+                # entirely still produces an output file.
+                if subtitle_fallback:
+                    try:
+                        fallback_detections = self._subtitle_fallback_detections(
+                            subtitle_scan_result,
+                            detection_result.detections,
+                            profanity_list,
+                            censor_mode,
+                        )
+                        if fallback_detections:
+                            detection_result.detections.extend(fallback_detections)
+                    except Exception as e:
+                        # The fallback is a safety net, not critical path — never fail the
+                        # whole run because of it; just log and continue with what we have.
+                        logger.warning(f"Subtitle fallback detection failed: {e}")
 
             # If no profanity detected, skip output file creation
             if not detection_result.detections:
@@ -299,6 +329,8 @@ class CensorEngine:
                     detection_result,
                     censor_mode,
                     progress_callback,
+                    audio_metadata=extraction_result.audio_metadata,
+                    enforce_max_duration=detections_path is None,
                 )
                 temp_files.append(censor_result.censored_audio_path)
             except Exception as e:
@@ -473,6 +505,7 @@ class CensorEngine:
         censor_mode: CensorMode,
         progress_callback: ProgressCallback,
         audio_metadata: AudioMetadata | None = None,
+        enforce_max_duration: bool = True,
     ):
         """Run audio censoring stage.
 
@@ -483,10 +516,22 @@ class CensorEngine:
         tracks. The output-assembly stage owns final encoding — it re-encodes this
         WAV to the source codec (or a fallback) at a sane bitrate — so the ``araw``
         issue is handled there, not by an expensive redundant encode in this stage.
+
+        When ``enforce_max_duration`` is False, the per-word duration cap (and the
+        implausibly-long-detection drop guard) are disabled. That cap exists to
+        defend against bad Whisper timestamps; but when the timings come from a
+        user-edited report, they are intentional and must be applied verbatim —
+        capping them would silently trim the user's chosen windows.
         """
         from video_profanity_censor.audio_processor import AudioProcessor
 
-        processor = AudioProcessor(mode=censor_mode)
+        if enforce_max_duration:
+            # Use AudioProcessor's own default cap (defends against bad timestamps).
+            processor = AudioProcessor(mode=censor_mode)
+        else:
+            # max_word_duration_ms=0 turns off both the cap and the drop guard, so
+            # user-edited report timings are applied verbatim.
+            processor = AudioProcessor(mode=censor_mode, max_word_duration_ms=0)
 
         # Generate temp output path for censored audio
         censored_path = Path(
@@ -517,6 +562,20 @@ class CensorEngine:
             censored_audio_path=censored_audio_path,
             output_path=output_path,
             audio_track_index=audio_track_index,
+        )
+
+    def _stage_load_detections(
+        self, detections_path: Path, default_mode: CensorMode
+    ) -> DetectionResult:
+        """Load detections from a (possibly hand-edited) report file.
+
+        Rows without an explicit action fall back to default_mode.
+        """
+        from video_profanity_censor.report_parser import parse_report
+
+        detections = parse_report(detections_path, default_mode=default_mode)
+        return DetectionResult(
+            detections=detections, total_words_scanned=len(detections)
         )
 
     def _subtitle_fallback_detections(

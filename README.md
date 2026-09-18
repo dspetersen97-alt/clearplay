@@ -90,6 +90,7 @@ The GUI lets you:
 - **Select an external subtitle file** (SRT/ASS/SSA), optional (single-file mode). If you leave it blank, the app automatically checks the video for **embedded subtitle tracks**, same as the CLI.
 - **Choose the censor mode** — mute (silence) or tone (beep).
 - **Choose the output path**, optional (defaults to `<input>_censored.<ext>`).
+- **Use a report**, optional (single-file mode): point at an edited `*_report.txt` to censor from its timings and skip transcription (see [Editing the timings and re-running](#editing-the-timings-and-re-running)).
 - **Check dependencies** with a single button that verifies FFmpeg is on your `PATH` and that all required Python packages are installed.
 - **Run** the pipeline with a live progress bar and log. Processing runs on a background thread so the window stays responsive.
 
@@ -146,6 +147,28 @@ Notes on batch mode:
 - Each file is processed independently — if one file fails (for example, an audio codec your FFmpeg build can't decode), the batch keeps going and lists the failures in a summary at the end.
 - Per-file options that name a single output (`--output`, `--report-path`, `--subtitle-path`) can't be combined with a folder input. Embedded subtitle pre-filtering still runs per file automatically.
 
+### Editing the timings and re-running
+
+Every run writes a detection report (`<output>_censored_report.txt`) listing each censored word with its start and end timestamps. If the automatic pass wasn't quite right — a mute that starts too late, an end that cuts a word off, or a spot you want to adjust by hand — you can edit that report and re-run using its timings directly, skipping transcription entirely.
+
+The workflow:
+
+1. Run the censor normally. Note the generated `..._report.txt`.
+2. Open the report and adjust the `Start` / `End` timestamps (or add/remove rows).
+3. Re-run with `--from-report`:
+
+```bash
+video-profanity-censor movie.mkv --from-report movie_censored_report.txt
+```
+
+This uses the timings in the file as-is and does not transcribe — so it's fast and doesn't need to download or run the Whisper model.
+
+Notes:
+
+- The report format is `Word   Start   End   Action`, with timestamps like `00:00:19.711` and an action of `muted` or `tone_replaced`. Editing is forgiving: extra spaces are fine, and timestamps also accept `MM:SS.mmm` or a plain number of seconds.
+- The `Action` column sets per-row mute vs. tone. If you leave it off a row, the `--mode` value is used for that row.
+- The `Word` column is just a label for your reference; only the timings and action affect the output.
+
 ### Supported input formats
 
 `.mp4`, `.mkv`, `.avi`, `.mov`, `.wmv` (maximum 50 GB, must contain at least one audio track).
@@ -161,6 +184,7 @@ Notes on batch mode:
 | `--profanity-list` | Path to a custom profanity list (one word per line) | bundled default list |
 | `--report-path` | Path for the detection report (single-file only) | `<output>_report.txt` |
 | `--subtitle-path` | External subtitle file (SRT/ASS/SSA) for pre-filtering (single-file only) | none |
+| `--from-report` | Censor using timestamps from an existing report `.txt`, skipping transcription (single-file only) | none |
 | `--disable-subtitle-prefilter` | Skip subtitle scanning and transcribe the full audio | off |
 | `--disable-subtitle-fallback` | Don't censor profane words that are in the subtitles but missed by audio transcription | off |
 | `--model-size` | Whisper model: `tiny`, `base`, `small`, `medium`, `large` | auto (by RAM) |

@@ -41,6 +41,10 @@ SUBTITLE_FILETYPES = [
     ("Subtitle files", "*.srt *.ass *.ssa"),
     ("All files", "*.*"),
 ]
+REPORT_FILETYPES = [
+    ("Report files", "*.txt"),
+    ("All files", "*.*"),
+]
 
 # Python packages the pipeline imports at runtime, mapped to install names.
 REQUIRED_PACKAGES: dict[str, str] = {
@@ -108,6 +112,7 @@ class CensorGUI:
         self.folder_var = tk.StringVar()
         self.subtitle_var = tk.StringVar()
         self.output_var = tk.StringVar()
+        self.report_var = tk.StringVar()
         self.mode_var = tk.StringVar(value="mute")
 
         self._build_widgets()
@@ -213,6 +218,34 @@ class CensorGUI:
         self.output_hint.grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
 
         row += 1
+        # Timings-from-report (optional, single-file mode only)
+        self.report_label = ttk.Label(frm, text="Use report\n(optional):")
+        self.report_label.grid(row=row, column=0, sticky="w", **pad)
+        self.report_entry = ttk.Entry(frm, textvariable=self.report_var)
+        self.report_entry.grid(row=row, column=1, sticky="ew", **pad)
+        rep_btns = ttk.Frame(frm)
+        rep_btns.grid(row=row, column=2, **pad)
+        self.report_btn = ttk.Button(
+            rep_btns, text="Browse...", command=self._browse_report
+        )
+        self.report_btn.pack(side="left")
+        self.report_clear_btn = ttk.Button(
+            rep_btns, text="Clear", command=lambda: self.report_var.set("")
+        )
+        self.report_clear_btn.pack(side="left", padx=(4, 0))
+
+        row += 1
+        self.report_hint = ttk.Label(
+            frm,
+            text="Optional: use timings from a (possibly edited) *_report.txt "
+            "instead of transcribing. Skips detection entirely.",
+            foreground="gray",
+            wraplength=560,
+            justify="left",
+        )
+        self.report_hint.grid(row=row, column=0, columnspan=3, sticky="w", padx=8)
+
+        row += 1
         # Censor mode
         ttk.Label(frm, text="Censor mode:").grid(row=row, column=0, sticky="w", **pad)
         mode_frame = ttk.Frame(frm)
@@ -273,6 +306,13 @@ class CensorGUI:
         if path:
             self.folder_var.set(path)
 
+    def _browse_report(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select detection report (.txt)", filetypes=REPORT_FILETYPES
+        )
+        if path:
+            self.report_var.set(path)
+
     def _update_input_mode(self) -> None:
         """Enable the widgets for the selected input mode and disable the others.
 
@@ -290,6 +330,7 @@ class CensorGUI:
         for w in (
             self.subtitle_entry, self.subtitle_btn, self.subtitle_clear_btn,
             self.output_entry, self.output_btn,
+            self.report_entry, self.report_btn, self.report_clear_btn,
         ):
             w.configure(state=file_state)
         for w in (self.folder_entry, self.folder_btn):
@@ -366,6 +407,10 @@ class CensorGUI:
             if not Path(video).is_file():
                 messagebox.showerror("Not found", f"Video file not found:\n{video}")
                 return
+            report = self.report_var.get().strip()
+            if report and not Path(report).is_file():
+                messagebox.showerror("Not found", f"Report file not found:\n{report}")
+                return
 
         # Verify dependencies before starting a long job.
         all_ok, lines = check_dependencies()
@@ -395,14 +440,20 @@ class CensorGUI:
                 daemon=True,
             )
         else:
-            self._log("--- Starting processing ---")
             subtitle = self.subtitle_var.get().strip()
             output = self.output_var.get().strip()
+            if report:
+                self._log(
+                    f"--- Starting processing (timings from report: {report}) ---"
+                )
+            else:
+                self._log("--- Starting processing ---")
             args = {
                 "input_path": Path(video),
                 "output_path": Path(output) if output else None,
                 "censor_mode": censor_mode,
                 "subtitle_path": Path(subtitle) if subtitle else None,
+                "detections_path": Path(report) if report else None,
             }
             self._worker = threading.Thread(
                 target=self._run_worker, args=(args,), daemon=True
