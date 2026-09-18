@@ -168,6 +168,7 @@ Notes:
 - The report format is `Word   Start   End   Action`, with timestamps like `00:00:19.711` and an action of `muted` or `tone_replaced`. Editing is forgiving: extra spaces are fine, and timestamps also accept `MM:SS.mmm` or a plain number of seconds.
 - The `Action` column sets per-row mute vs. tone. If you leave it off a row, the `--mode` value is used for that row.
 - The `Word` column is just a label for your reference; only the timings and action affect the output.
+- Timings from a report are applied **exactly as written** — the automatic per-word duration cap (which normally guards against bad transcription timestamps) is disabled here, so you can set a window of any length.
 
 ### Supported input formats
 
